@@ -9,6 +9,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
@@ -59,13 +60,42 @@ func main() {
 		listHostsCLI(configPath)
 	case "add":
 		addHost(configPath)
+	case "edit":
+		alias := ""
+		if len(args) > 1 {
+			alias = args[1]
+		}
+		editHost(configPath, alias)
 	case "delete":
 		deleteHost(configPath)
 	case "interactive":
 		runTUI(configPath)
+	case "help", "--help", "-h":
+		printHelp()
 	default:
-		runTUI(configPath)
+		fmt.Printf("Unknown command: %s\n\n", mode)
+		printHelp()
+		os.Exit(1)
 	}
+}
+
+func printHelp() {
+	fmt.Println("gossh - SSH host manager")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  gossh                    Launch interactive TUI")
+	fmt.Println("  gossh list               List all saved hosts")
+	fmt.Println("  gossh add                Add a new host")
+	fmt.Println("  gossh edit [alias]       Edit a host (select or specify by alias)")
+	fmt.Println("  gossh delete             Delete a host")
+	fmt.Println("  gossh help               Show this help")
+	fmt.Println()
+	fmt.Println("Interactive TUI keys:")
+	fmt.Println("  enter                    Connect to selected host")
+	fmt.Println("  e                        Edit selected host")
+	fmt.Println("  a                        Add a new host")
+	fmt.Println("  /                        Filter hosts")
+	fmt.Println("  ctrl+c  q                Quit")
 }
 
 // --- Bubble Tea TUI (The Main Menu) ---
@@ -75,6 +105,7 @@ var docStyle = lipgloss.NewStyle().Margin(1, 2)
 type model struct {
 	list     list.Model
 	selected *SSHEntry
+	action   string // "connect" or "edit"
 	quitting bool
 }
 
@@ -90,11 +121,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if msg.String() == "enter" {
-			// Get the selected item
 			if i, ok := m.list.SelectedItem().(SSHEntry); ok {
 				m.selected = &i
+				m.action = "connect"
 				return m, tea.Quit
 			}
+		}
+		if msg.String() == "e" && !m.list.SettingFilter() {
+			if i, ok := m.list.SelectedItem().(SSHEntry); ok {
+				m.selected = &i
+				m.action = "edit"
+				return m, tea.Quit
+			}
+		}
+		if msg.String() == "a" && !m.list.SettingFilter() {
+			m.action = "add"
+			return m, tea.Quit
 		}
 	case tea.WindowSizeMsg:
 		h, v := docStyle.GetFrameSize()
@@ -107,8 +149,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	if m.selected != nil {
-		return "" // Clear screen on exit to run SSH
+	if m.action != "" || m.quitting {
+		return ""
 	}
 	return docStyle.Render(m.list.View())
 }
@@ -117,11 +159,6 @@ func runTUI(path string) {
 	entries, err := parseConfig(path)
 	if err != nil {
 		fmt.Println("Error parsing config:", err)
-		return
-	}
-
-	if len(entries) == 0 {
-		fmt.Println("No hosts found. Run 'gossh add' first.")
 		return
 	}
 
@@ -138,6 +175,12 @@ func runTUI(path string) {
 	l.SetFilteringEnabled(true)
 	l.Styles.Title = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFF")).Background(lipgloss.Color("#7D56F4")).Padding(0, 1)
 
+	connectKey := key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "connect"))
+	editKey := key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit"))
+	addKey := key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add"))
+	l.AdditionalShortHelpKeys = func() []key.Binding { return []key.Binding{connectKey, editKey, addKey} }
+	l.AdditionalFullHelpKeys = func() []key.Binding { return []key.Binding{connectKey, editKey, addKey} }
+
 	m := model{list: l}
 
 	// Run Bubble Tea Program
@@ -148,17 +191,27 @@ func runTUI(path string) {
 		os.Exit(1)
 	}
 
-	// Extract selection and Connect
-	if finalM, ok := finalModel.(model); ok && finalM.selected != nil {
-		fmt.Printf("Connecting to %s (%s)...\n", finalM.selected.Alias, finalM.selected.HostName)
-
-		cmd := exec.Command("ssh", finalM.selected.Alias)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			os.Exit(1)
+	if finalM, ok := finalModel.(model); ok {
+		switch finalM.action {
+		case "connect":
+			if finalM.selected == nil {
+				return
+			}
+			fmt.Printf("Connecting to %s (%s)...\n", finalM.selected.Alias, finalM.selected.HostName)
+			cmd := exec.Command("ssh", finalM.selected.Alias)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				os.Exit(1)
+			}
+		case "edit":
+			if finalM.selected == nil {
+				return
+			}
+			editHost(path, finalM.selected.Alias)
+		case "add":
+			addHost(path)
 		}
 	}
 }
@@ -199,6 +252,10 @@ func addHost(path string) {
 				Title("Port").
 				Description("Optional (default 22)").
 				Value(&entry.Port),
+			huh.NewInput().
+				Title("IdentityFile").
+				Description("Optional path to SSH key").
+				Value(&entry.IdentityFile),
 		),
 	)
 
@@ -255,6 +312,95 @@ func deleteHost(path string) {
 
 	writeConfig(path, newEntries)
 	fmt.Printf("Deleted %s\n", selectedAlias)
+}
+
+func editHost(path string, alias string) {
+	entries, _ := parseConfig(path)
+	if len(entries) == 0 {
+		fmt.Println("No hosts to edit.")
+		return
+	}
+
+	if alias == "" {
+		options := make([]huh.Option[string], len(entries))
+		for i, e := range entries {
+			options[i] = huh.NewOption(fmt.Sprintf("%s (%s)", e.Alias, e.HostName), e.Alias)
+		}
+
+		form := huh.NewForm(
+			huh.NewGroup(
+				huh.NewSelect[string]().
+					Title("Select Host to Edit").
+					Options(options...).
+					Value(&alias),
+			),
+		)
+		if err := form.Run(); err != nil {
+			return
+		}
+	}
+
+	idx := -1
+	for i, e := range entries {
+		if e.Alias == alias {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		fmt.Printf("Host '%s' not found.\n", alias)
+		return
+	}
+
+	entry := entries[idx]
+
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Host Alias").
+				Description("Short name (e.g. prod-db)").
+				Value(&entry.Alias).
+				Validate(func(s string) error {
+					if s == "" {
+						return fmt.Errorf("alias is required")
+					}
+					return nil
+				}),
+			huh.NewInput().
+				Title("HostName").
+				Description("IP address or Domain").
+				Value(&entry.HostName).
+				Validate(func(s string) error {
+					if s == "" {
+						return fmt.Errorf("hostname is required")
+					}
+					return nil
+				}),
+			huh.NewInput().
+				Title("User").
+				Description("Optional username").
+				Value(&entry.User),
+			huh.NewInput().
+				Title("Port").
+				Description("Optional (default 22)").
+				Value(&entry.Port),
+			huh.NewInput().
+				Title("IdentityFile").
+				Description("Optional path to SSH key").
+				Value(&entry.IdentityFile),
+		),
+	)
+
+	if err := form.Run(); err != nil {
+		return
+	}
+
+	entries[idx] = entry
+	if err := writeConfig(path, entries); err != nil {
+		fmt.Println("Error saving:", err)
+	} else {
+		fmt.Println("Host updated!")
+	}
 }
 
 func listHostsCLI(path string) {
