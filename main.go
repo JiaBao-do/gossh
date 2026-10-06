@@ -1,11 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 
@@ -16,15 +17,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// --- Structs ---
-
-type SSHEntry struct {
-	Alias        string
-	HostName     string
-	User         string
-	Port         string
-	IdentityFile string
-}
+// version is set at build time via -ldflags "-X main.version=..."
+var version = "dev"
 
 // Implement list.Item interface for Bubble Tea
 func (e SSHEntry) Title() string { return e.Alias }
@@ -43,6 +37,17 @@ func (e SSHEntry) FilterValue() string { return e.Alias + e.HostName + e.User }
 // --- Main ---
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "version", "--version", "-v":
+			fmt.Printf("gossh %s\n", version)
+			return
+		case "help", "--help", "-h":
+			printHelp()
+			return
+		}
+	}
+
 	configPath, err := getConfigPath()
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -68,14 +73,21 @@ func main() {
 		editHost(configPath, alias)
 	case "delete":
 		deleteHost(configPath)
+	case "keys", "key":
+		keysCommand(configPath, args[1:])
+	case "forward", "fwd":
+		forwardCommand(configPath, args[1:])
+	case "connect":
+		if len(args) < 2 {
+			fmt.Println("Usage: gossh connect <alias|user@host> [ssh args...]")
+			os.Exit(1)
+		}
+		runSSH(args[1:]...)
 	case "interactive":
 		runTUI(configPath)
-	case "help", "--help", "-h":
-		printHelp()
 	default:
-		fmt.Printf("Unknown command: %s\n\n", mode)
-		printHelp()
-		os.Exit(1)
+		// Anything else is handed to ssh: "gossh prod-db", "gossh user@host -p 2222".
+		runSSH(args...)
 	}
 }
 
@@ -83,19 +95,70 @@ func printHelp() {
 	fmt.Println("gossh - SSH host manager")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  gossh                    Launch interactive TUI")
-	fmt.Println("  gossh list               List all saved hosts")
-	fmt.Println("  gossh add                Add a new host")
-	fmt.Println("  gossh edit [alias]       Edit a host (select or specify by alias)")
-	fmt.Println("  gossh delete             Delete a host")
-	fmt.Println("  gossh help               Show this help")
+	fmt.Println("  gossh                       Launch interactive TUI")
+	fmt.Println("  gossh <alias> [args]        Connect to a saved host (any ssh args work)")
+	fmt.Println("  gossh user@host [args]      Plain ssh passthrough")
+	fmt.Println("  gossh connect <alias>       Connect (use if an alias clashes with a command)")
+	fmt.Println("  gossh list                  List all saved hosts")
+	fmt.Println("  gossh add                   Add a new host")
+	fmt.Println("  gossh edit [alias]          Edit a host (select or specify by alias)")
+	fmt.Println("  gossh delete                Delete a host")
+	fmt.Println()
+	fmt.Println("Port forwarding:")
+	fmt.Println("  gossh forward               Guided port forward (pick host and ports)")
+	fmt.Println("  gossh forward <alias> SPEC...")
+	fmt.Println("      8080                    localhost:8080 -> remote localhost:8080")
+	fmt.Println("      8080:80                 localhost:8080 -> remote localhost:80")
+	fmt.Println("      5433:db.internal:5432   localhost:5433 -> db.internal:5432 (seen from remote)")
+	fmt.Println("      R:9000:3000             remote port 9000 -> your localhost:3000")
+	fmt.Println("      D:1080                  SOCKS proxy on localhost:1080 through the host")
+	fmt.Println()
+	fmt.Println("Keys (stored in ~/.ssh/keys):")
+	fmt.Println("  gossh keys                  List managed keys")
+	fmt.Println("  gossh keys import <path>    Copy a key into ~/.ssh/keys")
+	fmt.Println("  gossh keys migrate          Copy/move keys that hosts reference elsewhere")
+	fmt.Println()
+	fmt.Println("  gossh version               Show version")
+	fmt.Println("  gossh help                  Show this help")
+	fmt.Println()
+	fmt.Println("Existing hosts are never changed automatically. When you set an IdentityFile")
+	fmt.Println("outside ~/.ssh/keys you choose to copy it, move it, or keep it where it is.")
+	fmt.Println("~/.ssh/config is backed up to ~/.ssh/config.bak before every change.")
 	fmt.Println()
 	fmt.Println("Interactive TUI keys:")
-	fmt.Println("  enter                    Connect to selected host")
-	fmt.Println("  e                        Edit selected host")
-	fmt.Println("  a                        Add a new host")
-	fmt.Println("  /                        Filter hosts")
-	fmt.Println("  ctrl+c  q                Quit")
+	fmt.Println("  enter                       Connect to selected host")
+	fmt.Println("  f                           Port forward through selected host")
+	fmt.Println("  e                           Edit selected host")
+	fmt.Println("  a                           Add a new host")
+	fmt.Println("  /                           Filter hosts")
+	fmt.Println("  ctrl+c  q                   Quit")
+}
+
+// runSSH runs the system ssh client with the given arguments and exits with its status.
+func runSSH(args ...string) {
+	sshPath, err := exec.LookPath("ssh")
+	if err != nil {
+		fmt.Println("Error: ssh client not found on PATH.")
+		if runtime.GOOS == "windows" {
+			fmt.Println("Install it with (admin): Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0")
+		}
+		os.Exit(1)
+	}
+
+	// ssh handles Ctrl+C itself (e.g. to stop a forward); don't let it kill gossh first.
+	signal.Ignore(os.Interrupt)
+
+	cmd := exec.Command(sshPath, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		fmt.Println("Error:", err)
+		os.Exit(1)
+	}
 }
 
 // --- Bubble Tea TUI (The Main Menu) ---
@@ -105,7 +168,7 @@ var docStyle = lipgloss.NewStyle().Margin(1, 2)
 type model struct {
 	list     list.Model
 	selected *SSHEntry
-	action   string // "connect" or "edit"
+	action   string // "connect", "edit", "add" or "forward"
 	quitting bool
 }
 
@@ -127,16 +190,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 		}
-		if msg.String() == "e" && !m.list.SettingFilter() {
-			if i, ok := m.list.SelectedItem().(SSHEntry); ok {
-				m.selected = &i
-				m.action = "edit"
+		if !m.list.SettingFilter() {
+			switch msg.String() {
+			case "e", "f":
+				if i, ok := m.list.SelectedItem().(SSHEntry); ok {
+					m.selected = &i
+					m.action = map[string]string{"e": "edit", "f": "forward"}[msg.String()]
+					return m, tea.Quit
+				}
+			case "a":
+				m.action = "add"
 				return m, tea.Quit
 			}
-		}
-		if msg.String() == "a" && !m.list.SettingFilter() {
-			m.action = "add"
-			return m, tea.Quit
 		}
 	case tea.WindowSizeMsg:
 		h, v := docStyle.GetFrameSize()
@@ -163,8 +228,9 @@ func runTUI(path string) {
 	}
 
 	// Convert SSHEntry to []list.Item
-	items := make([]list.Item, len(entries))
-	for i, e := range entries {
+	visible := hosts(entries)
+	items := make([]list.Item, len(visible))
+	for i, e := range visible {
 		items[i] = e
 	}
 
@@ -176,10 +242,12 @@ func runTUI(path string) {
 	l.Styles.Title = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFF")).Background(lipgloss.Color("#7D56F4")).Padding(0, 1)
 
 	connectKey := key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "connect"))
+	forwardKey := key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "forward"))
 	editKey := key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit"))
 	addKey := key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add"))
-	l.AdditionalShortHelpKeys = func() []key.Binding { return []key.Binding{connectKey, editKey, addKey} }
-	l.AdditionalFullHelpKeys = func() []key.Binding { return []key.Binding{connectKey, editKey, addKey} }
+	bindings := []key.Binding{connectKey, forwardKey, editKey, addKey}
+	l.AdditionalShortHelpKeys = func() []key.Binding { return bindings }
+	l.AdditionalFullHelpKeys = func() []key.Binding { return bindings }
 
 	m := model{list: l}
 
@@ -198,13 +266,12 @@ func runTUI(path string) {
 				return
 			}
 			fmt.Printf("Connecting to %s (%s)...\n", finalM.selected.Alias, finalM.selected.HostName)
-			cmd := exec.Command("ssh", finalM.selected.Alias)
-			cmd.Stdin = os.Stdin
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				os.Exit(1)
+			runSSH(finalM.selected.Alias)
+		case "forward":
+			if finalM.selected == nil {
+				return
 			}
+			forwardInteractive(path, finalM.selected.Alias)
 		case "edit":
 			if finalM.selected == nil {
 				return
@@ -218,32 +285,30 @@ func runTUI(path string) {
 
 // --- CRUD Operations (Using 'huh' for forms) ---
 
-func addHost(path string) {
-	var entry SSHEntry
+func required(name string) func(string) error {
+	return func(s string) error {
+		if s == "" {
+			return fmt.Errorf("%s is required", name)
+		}
+		return nil
+	}
+}
 
-	// 'huh' replaces 'survey' for forms
-	form := huh.NewForm(
+// hostForm edits entry in place. originalKey is the IdentityFile before editing;
+// it is accepted as-is even if the file no longer exists.
+func hostForm(entry *SSHEntry, originalKey string) *huh.Form {
+	return huh.NewForm(
 		huh.NewGroup(
 			huh.NewInput().
 				Title("Host Alias").
 				Description("Short name (e.g. prod-db)").
 				Value(&entry.Alias).
-				Validate(func(s string) error {
-					if s == "" {
-						return fmt.Errorf("alias is required")
-					}
-					return nil
-				}),
+				Validate(required("alias")),
 			huh.NewInput().
 				Title("HostName").
 				Description("IP address or Domain").
 				Value(&entry.HostName).
-				Validate(func(s string) error {
-					if s == "" {
-						return fmt.Errorf("hostname is required")
-					}
-					return nil
-				}),
+				Validate(required("hostname")),
 			huh.NewInput().
 				Title("User").
 				Description("Optional username").
@@ -254,19 +319,63 @@ func addHost(path string) {
 				Value(&entry.Port),
 			huh.NewInput().
 				Title("IdentityFile").
-				Description("Optional path to SSH key").
-				Value(&entry.IdentityFile),
+				Description("Optional key name in ~/.ssh/keys (tab completes) or a path to a key").
+				Suggestions(keySuggestions()).
+				Value(&entry.IdentityFile).
+				Validate(validateIdentityFile(originalKey)),
 		),
 	)
+}
 
-	err := form.Run()
+// applyKeyChoice resolves a changed IdentityFile, asking the user what to do with
+// keys stored outside ~/.ssh/keys. Unchanged values are left exactly as they were.
+// entries/self are used to avoid moving a key another host still needs.
+func applyKeyChoice(entry *SSHEntry, originalKey string, entries []SSHEntry, self int) error {
+	if entry.IdentityFile == originalKey {
+		return nil
+	}
+	mode := keyKeep
+	if needsImport(entry.IdentityFile) {
+		var err error
+		if mode, err = askKeyMode(entry.IdentityFile); err != nil {
+			return err
+		}
+		if mode == keyMove {
+			if users := keyUsedBy(entries, entry.IdentityFile, map[int]bool{self: true}); len(users) > 0 {
+				fmt.Printf("Copying instead of moving: the key is also used by %s\n", strings.Join(users, ", "))
+				mode = keyCopy
+			}
+		}
+	}
+	resolved, err := resolveIdentityFile(entry.IdentityFile, mode)
 	if err != nil {
-		return // User cancelled
+		return err
+	}
+	entry.IdentityFile = resolved
+	return nil
+}
+
+func addHost(path string) {
+	entries, err := parseConfig(path)
+	if err != nil {
+		fmt.Println("Error parsing config:", err)
+		return
 	}
 
-	entries, _ := parseConfig(path)
-	entries = append(entries, entry)
+	entry := newHostEntry()
+	if err := hostForm(&entry, "").Run(); err != nil {
+		return // User cancelled
+	}
+	if findHost(entries, entry.Alias) != -1 {
+		fmt.Printf("Host '%s' already exists; use: gossh edit %s\n", entry.Alias, entry.Alias)
+		return
+	}
+	if err := applyKeyChoice(&entry, "", entries, -1); err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
 
+	entries = append(entries, entry)
 	if err := writeConfig(path, entries); err != nil {
 		fmt.Println("Error saving:", err)
 	} else {
@@ -274,124 +383,75 @@ func addHost(path string) {
 	}
 }
 
-func deleteHost(path string) {
-	entries, _ := parseConfig(path)
-	if len(entries) == 0 {
-		fmt.Println("No hosts to delete.")
-		return
+// selectHost asks the user to pick one of the editable hosts.
+func selectHost(entries []SSHEntry, title string) (string, bool) {
+	visible := hosts(entries)
+	if len(visible) == 0 {
+		fmt.Println("No hosts saved yet. Add one with: gossh add")
+		return "", false
 	}
-
-	// Map entries to options for huh.Select
-	options := make([]huh.Option[string], len(entries))
-	for i, e := range entries {
+	options := make([]huh.Option[string], len(visible))
+	for i, e := range visible {
 		options[i] = huh.NewOption(fmt.Sprintf("%s (%s)", e.Alias, e.HostName), e.Alias)
 	}
+	var alias string
+	err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Title(title).Options(options...).Value(&alias),
+	)).Run()
+	return alias, err == nil
+}
 
-	var selectedAlias string
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("Select Host to Delete").
-				Options(options...).
-				Value(&selectedAlias),
-		),
-	)
-
-	err := form.Run()
+func deleteHost(path string) {
+	entries, err := parseConfig(path)
 	if err != nil {
+		fmt.Println("Error parsing config:", err)
+		return
+	}
+	alias, ok := selectHost(entries, "Select Host to Delete")
+	if !ok {
 		return
 	}
 
-	// Filter out the deleted one
-	var newEntries []SSHEntry
-	for _, e := range entries {
-		if e.Alias != selectedAlias {
-			newEntries = append(newEntries, e)
-		}
+	idx := findHost(entries, alias)
+	entries = append(entries[:idx], entries[idx+1:]...)
+	if err := writeConfig(path, entries); err != nil {
+		fmt.Println("Error saving:", err)
+		return
 	}
-
-	writeConfig(path, newEntries)
-	fmt.Printf("Deleted %s\n", selectedAlias)
+	fmt.Printf("Deleted %s\n", alias)
 }
 
 func editHost(path string, alias string) {
-	entries, _ := parseConfig(path)
-	if len(entries) == 0 {
-		fmt.Println("No hosts to edit.")
+	entries, err := parseConfig(path)
+	if err != nil {
+		fmt.Println("Error parsing config:", err)
 		return
 	}
 
 	if alias == "" {
-		options := make([]huh.Option[string], len(entries))
-		for i, e := range entries {
-			options[i] = huh.NewOption(fmt.Sprintf("%s (%s)", e.Alias, e.HostName), e.Alias)
-		}
-
-		form := huh.NewForm(
-			huh.NewGroup(
-				huh.NewSelect[string]().
-					Title("Select Host to Edit").
-					Options(options...).
-					Value(&alias),
-			),
-		)
-		if err := form.Run(); err != nil {
+		var ok bool
+		if alias, ok = selectHost(entries, "Select Host to Edit"); !ok {
 			return
 		}
 	}
 
-	idx := -1
-	for i, e := range entries {
-		if e.Alias == alias {
-			idx = i
-			break
-		}
-	}
+	idx := findHost(entries, alias)
 	if idx == -1 {
 		fmt.Printf("Host '%s' not found.\n", alias)
 		return
 	}
 
 	entry := entries[idx]
-
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewInput().
-				Title("Host Alias").
-				Description("Short name (e.g. prod-db)").
-				Value(&entry.Alias).
-				Validate(func(s string) error {
-					if s == "" {
-						return fmt.Errorf("alias is required")
-					}
-					return nil
-				}),
-			huh.NewInput().
-				Title("HostName").
-				Description("IP address or Domain").
-				Value(&entry.HostName).
-				Validate(func(s string) error {
-					if s == "" {
-						return fmt.Errorf("hostname is required")
-					}
-					return nil
-				}),
-			huh.NewInput().
-				Title("User").
-				Description("Optional username").
-				Value(&entry.User),
-			huh.NewInput().
-				Title("Port").
-				Description("Optional (default 22)").
-				Value(&entry.Port),
-			huh.NewInput().
-				Title("IdentityFile").
-				Description("Optional path to SSH key").
-				Value(&entry.IdentityFile),
-		),
-	)
-
-	if err := form.Run(); err != nil {
+	originalKey := entry.IdentityFile
+	if err := hostForm(&entry, originalKey).Run(); err != nil {
+		return
+	}
+	if entry.Alias != alias && findHost(entries, entry.Alias) != -1 {
+		fmt.Printf("Host '%s' already exists.\n", entry.Alias)
+		return
+	}
+	if err := applyKeyChoice(&entry, originalKey, entries, idx); err != nil {
+		fmt.Println("Error:", err)
 		return
 	}
 
@@ -404,11 +464,15 @@ func editHost(path string, alias string) {
 }
 
 func listHostsCLI(path string) {
-	entries, _ := parseConfig(path)
+	entries, err := parseConfig(path)
+	if err != nil {
+		fmt.Println("Error parsing config:", err)
+		return
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "ALIAS\tHOST\tUSER\tPORT")
-	for _, e := range entries {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.Alias, e.HostName, e.User, e.Port)
+	fmt.Fprintln(w, "ALIAS\tHOST\tUSER\tPORT\tKEY")
+	for _, e := range hosts(entries) {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Alias, e.HostName, e.User, e.Port, e.IdentityFile)
 	}
 	w.Flush()
 }
@@ -416,91 +480,12 @@ func listHostsCLI(path string) {
 // --- Configuration Helpers (Standard Lib) ---
 
 func getConfigPath() (string, error) {
-	home, err := os.UserHomeDir()
+	if err := ensureSSHLayout(); err != nil {
+		return "", err
+	}
+	sshDir, _, err := sshDirs()
 	if err != nil {
 		return "", err
 	}
-	configDir := filepath.Join(home, ".ssh")
-	if _, err := os.Stat(configDir); os.IsNotExist(err) {
-		os.Mkdir(configDir, 0700)
-	}
-	return filepath.Join(configDir, "config"), nil
-}
-
-func parseConfig(path string) ([]SSHEntry, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []SSHEntry{}, nil
-		}
-		return nil, err
-	}
-	defer file.Close()
-
-	var entries []SSHEntry
-	var current *SSHEntry
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			continue
-		}
-
-		key := strings.ToLower(parts[0])
-		value := parts[1]
-
-		if key == "host" {
-			if current != nil {
-				entries = append(entries, *current)
-			}
-			current = &SSHEntry{Alias: value}
-		} else if current != nil {
-			switch key {
-			case "hostname":
-				current.HostName = value
-			case "user":
-				current.User = value
-			case "port":
-				current.Port = value
-			case "identityfile":
-				current.IdentityFile = value
-			}
-		}
-	}
-	if current != nil {
-		entries = append(entries, *current)
-	}
-	return entries, scanner.Err()
-}
-
-func writeConfig(path string, entries []SSHEntry) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := bufio.NewWriter(f)
-	for _, e := range entries {
-		fmt.Fprintf(w, "Host %s\n", e.Alias)
-		if e.HostName != "" {
-			fmt.Fprintf(w, "  HostName %s\n", e.HostName)
-		}
-		if e.User != "" {
-			fmt.Fprintf(w, "  User %s\n", e.User)
-		}
-		if e.Port != "" {
-			fmt.Fprintf(w, "  Port %s\n", e.Port)
-		}
-		if e.IdentityFile != "" {
-			fmt.Fprintf(w, "  IdentityFile %s\n", e.IdentityFile)
-		}
-		fmt.Fprintln(w, "")
-	}
-	return w.Flush()
+	return filepath.Join(sshDir, "config"), nil
 }
