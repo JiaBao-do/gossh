@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/charmbracelet/huh"
 )
@@ -313,77 +312,102 @@ func keyUsedBy(entries []SSHEntry, src string, skip map[int]bool) []string {
 // --- CLI -----------------------------------------------------------------
 
 // keysCommand implements "gossh keys [import <path> | migrate]".
-func keysCommand(configPath string, args []string) {
-	if len(args) == 0 || args[0] == "list" {
-		listKeysCLI()
-		return
+// keysMenu is the "k" screen: see the managed keys, import one, or bring
+// the keys hosts use from other folders into ~/.ssh/keys.
+func keysMenu(configPath string) (string, error) {
+	desc := "No keys in ~/.ssh/keys yet."
+	if keys := listKeys(); len(keys) > 0 {
+		desc = "In ~/.ssh/keys: " + strings.Join(keys, ", ")
 	}
-	switch args[0] {
+	action := "import"
+	if err := huh.NewSelect[string]().
+		Title("Keys").
+		Description(desc).
+		Options(
+			huh.NewOption("Import a key file (.pem, id_rsa, ...) into ~/.ssh/keys", "import"),
+			huh.NewOption("Bring keys my hosts use from other folders into ~/.ssh/keys", "migrate"),
+			huh.NewOption("Back", ""),
+		).
+		Value(&action).
+		Run(); err != nil {
+		return "", err
+	}
+	switch action {
 	case "import":
-		if len(args) < 2 {
-			fmt.Println("Usage: gossh keys import <path> [--move]")
-			os.Exit(1)
-		}
-		move := len(args) > 2 && args[2] == "--move"
-		importKeyCLI(configPath, args[1], move)
+		return importKeyInteractive(configPath)
 	case "migrate":
-		migrateKeysCLI(configPath)
-	default:
-		fmt.Println("Usage: gossh keys [list | import <path> [--move] | migrate]")
-		os.Exit(1)
+		return migrateKeys(configPath)
 	}
+	return "", nil
 }
 
-func importKeyCLI(configPath, path string, move bool) {
+// importKeyInteractive picks a key file (found ones first, or browse) and
+// copies or moves it into ~/.ssh/keys.
+func importKeyInteractive(configPath string) (string, error) {
 	_, keysDir, err := sshDirs()
 	if err != nil {
-		fmt.Println("Error:", err)
-		os.Exit(1)
+		return "", err
 	}
-	src, err := filepath.Abs(expandHome(path))
+	var opts []huh.Option[string]
+	for _, p := range discoverKeys() {
+		opts = append(opts, huh.NewOption(tildePath(p), p))
+	}
+	opts = append(opts, huh.NewOption("Browse for a key file...", keyChoiceBrowse))
+
+	choice, browsed, move := keyChoiceBrowse, "", false
+	if err := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Which key?").
+				Description("Private keys found in ~/.ssh, Downloads and Desktop").
+				Options(opts...).
+				Value(&choice),
+		),
+		huh.NewGroup(
+			keyFilePicker("Pick the private key file", &browsed, validateIdentityFile("")),
+		).WithHideFunc(func() bool { return choice != keyChoiceBrowse }),
+		huh.NewGroup(
+			huh.NewSelect[bool]().
+				Title("Copy or move it into ~/.ssh/keys?").
+				Options(
+					huh.NewOption("Copy (keep the original)", false),
+					huh.NewOption("Move (remove the original)", true),
+				).
+				Value(&move),
+		),
+	).Run(); err != nil {
+		return "", err
+	}
+	if choice == keyChoiceBrowse {
+		choice = browsed
+	}
+	src, err := filepath.Abs(expandHome(choice))
 	if err != nil {
-		fmt.Println("Error:", err)
-		os.Exit(1)
+		return "", err
 	}
+
+	note := ""
 	if move {
 		if entries, err := parseConfig(configPath); err == nil {
 			if users := keyUsedBy(entries, src, nil); len(users) > 0 {
-				fmt.Printf("Copying instead of moving: still used by %s. Run 'gossh keys migrate' to move it and update them.\n", strings.Join(users, ", "))
+				note = fmt.Sprintf(" (copied, not moved: %s still use the original)", strings.Join(users, ", "))
 				move = false
 			}
 		}
 	}
 	name, err := importKey(src, keysDir, move)
 	if err != nil {
-		fmt.Println("Error:", err)
-		os.Exit(1)
+		return "", err
 	}
-	fmt.Printf("Use it as IdentityFile %q (or %s/%s)\n", name, keysDirRef, name)
+	return fmt.Sprintf("Imported %s as %s/%s%s", filepath.Base(src), keysDirRef, name, note), nil
 }
 
-func listKeysCLI() {
-	_, keysDir, _ := sshDirs()
-	keys := listKeys()
-	if len(keys) == 0 {
-		fmt.Printf("No keys in %s\n", keysDir)
-		fmt.Println("Import one with: gossh keys import <path>")
-		return
-	}
-	fmt.Printf("Keys in %s:\n", keysDir)
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	for _, k := range keys {
-		fmt.Fprintf(w, "  %s\t%s/%s\n", k, keysDirRef, k)
-	}
-	w.Flush()
-}
-
-// migrateKeysCLI moves or copies keys referenced from outside ~/.ssh/keys, for the
+// migrateKeys moves or copies keys referenced from outside ~/.ssh/keys, for the
 // hosts the user picks, and rewrites those hosts' IdentityFile.
-func migrateKeysCLI(configPath string) {
+func migrateKeys(configPath string) (string, error) {
 	entries, err := parseConfig(configPath)
 	if err != nil {
-		fmt.Println("Error parsing config:", err)
-		os.Exit(1)
+		return "", fmt.Errorf("parsing config: %w", err)
 	}
 
 	var options []huh.Option[string]
@@ -404,12 +428,12 @@ func migrateKeysCLI(configPath string) {
 		selected = append(selected, e.Alias)
 	}
 
-	for _, m := range missing {
-		fmt.Printf("Skipping %s (file not found or uses ssh tokens)\n", m)
+	var notes []string
+	if len(missing) > 0 {
+		notes = append(notes, "skipped "+strings.Join(missing, ", ")+" (file not found or uses ssh tokens)")
 	}
 	if len(options) == 0 {
-		fmt.Println("All host keys are already in ~/.ssh/keys.")
-		return
+		return strings.Join(append([]string{"All host keys are already in ~/.ssh/keys"}, notes...), "; "), nil
 	}
 
 	mode := keyCopy
@@ -428,9 +452,11 @@ func migrateKeysCLI(configPath string) {
 			).
 			Value(&mode),
 	)).Run()
-	if err != nil || mode == keyKeep || len(selected) == 0 {
-		fmt.Println("No changes made.")
-		return
+	if err != nil {
+		return "", err
+	}
+	if mode == keyKeep || len(selected) == 0 {
+		return "No changes made", nil
 	}
 
 	// Several hosts can share one key; import each source file once.
@@ -443,7 +469,7 @@ func migrateKeysCLI(configPath string) {
 		if !ok {
 			// Copy first; moving happens only after every host is updated.
 			if ref, err = resolveIdentityFile(src, keyCopy); err != nil {
-				fmt.Printf("%s: %v\n", alias, err)
+				notes = append(notes, fmt.Sprintf("%s: %v", alias, err))
 				continue
 			}
 			imported[src] = ref
@@ -452,11 +478,10 @@ func migrateKeysCLI(configPath string) {
 		changed++
 	}
 	if changed == 0 {
-		return
+		return strings.Join(append([]string{"No hosts updated"}, notes...), "; "), nil
 	}
 	if err := writeConfig(configPath, entries); err != nil {
-		fmt.Println("Error saving:", err)
-		os.Exit(1)
+		return "", fmt.Errorf("saving: %w", err)
 	}
 	if mode == keyMove {
 		skip := map[int]bool{}
@@ -465,16 +490,70 @@ func migrateKeysCLI(configPath string) {
 		}
 		for src := range imported {
 			if users := keyUsedBy(entries, src, skip); len(users) > 0 {
-				fmt.Printf("Kept original %s (still used by %s)\n", src, strings.Join(users, ", "))
+				notes = append(notes, fmt.Sprintf("kept %s (still used by %s)", src, strings.Join(users, ", ")))
 				continue
 			}
 			if err := os.Remove(src); err != nil {
-				fmt.Printf("Could not remove %s: %v\n", src, err)
+				notes = append(notes, fmt.Sprintf("could not remove %s: %v", src, err))
 				continue
 			}
 			os.Remove(src + ".pub")
-			fmt.Printf("Removed original %s\n", src)
 		}
 	}
-	fmt.Printf("Updated %d host(s). Previous config saved to %s.bak\n", changed, configPath)
+	summary := fmt.Sprintf("Updated %d host(s) to use ~/.ssh/keys (old config in config.bak)", changed)
+	return strings.Join(append([]string{summary}, notes...), "; "), nil
+}
+
+// isPrivateKey reports whether path looks like a PEM/OpenSSH private key.
+func isPrivateKey(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, 128)
+	n, _ := f.Read(head)
+	return bytes.Contains(head[:n], []byte("PRIVATE KEY-----"))
+}
+
+// discoverKeys finds private keys outside ~/.ssh/keys that the user probably
+// means: loose keys in ~/.ssh and .pem/.key files in Downloads and Desktop.
+func discoverKeys() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	var found []string
+	for _, dir := range []string{filepath.Join(home, ".ssh"), filepath.Join(home, "Downloads"), filepath.Join(home, "Desktop")} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || strings.HasSuffix(name, ".pub") {
+				continue
+			}
+			ext := strings.ToLower(filepath.Ext(name))
+			if filepath.Base(dir) != ".ssh" && ext != ".pem" && ext != ".key" {
+				continue // outside ~/.ssh only look at obvious key files
+			}
+			if p := filepath.Join(dir, name); isPrivateKey(p) {
+				found = append(found, p)
+			}
+		}
+	}
+	return found
+}
+
+// tildePath shows a path under the home directory as ~/...
+func tildePath(p string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	if rel, err := filepath.Rel(home, p); err == nil && !strings.HasPrefix(rel, "..") {
+		return "~/" + filepath.ToSlash(rel)
+	}
+	return p
 }

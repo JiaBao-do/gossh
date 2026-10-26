@@ -5,15 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
-	"os/signal"
-	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/charmbracelet/x/term"
+	"github.com/pkg/sftp"
 )
 
 // --- Progress ---
@@ -22,8 +22,10 @@ import (
 type progress struct {
 	total     atomic.Int64 // bytes
 	done      atomic.Int64
-	files     atomic.Int64 // files finished
-	fileCount atomic.Int64 // files planned
+	files     atomic.Int64 // files copied
+	fileCount atomic.Int64 // files still planned or copied (skips are removed)
+	kept      atomic.Int64 // existing files left alone (skip / not newer)
+	renamed   atomic.Int64 // copies saved under a new name
 
 	mu      sync.Mutex
 	current string
@@ -78,12 +80,39 @@ func (c *countingReader) Read(b []byte) (int, error) {
 // Size lets sftp.File.ReadFrom see how much is left so it uploads concurrently.
 func (c *countingReader) Size() int64 { return c.remain }
 
+// --- Conflicts ---
+
+// conflictAction says what to do when the destination file already exists.
+type conflictAction int
+
+const (
+	conflictAsk conflictAction = iota // call copyOptions.ask
+	conflictOverwrite
+	conflictNewer // overwrite only if the source is newer
+	conflictSkip
+	conflictRename // keep both: save as "name (1).ext"
+)
+
+type conflict struct {
+	src, dst         string
+	srcInfo, dstInfo os.FileInfo
+}
+
+// newerThan compares at one second resolution, which is all SFTP keeps.
+func newerThan(a, b time.Time) bool {
+	return a.Truncate(time.Second).After(b.Truncate(time.Second))
+}
+
 // --- Copy engine ---
 
 type copyOptions struct {
 	recursive     bool // copy directories
 	preserveTimes bool
 	preserveMode  bool
+	onConflict    conflictAction
+	// ask decides a conflict when onConflict is conflictAsk. It is called
+	// from the copying goroutine and may block.
+	ask func(conflict) conflictAction
 }
 
 type copyItem struct {
@@ -91,18 +120,52 @@ type copyItem struct {
 	info     os.FileInfo
 }
 
+type failure struct {
+	path string
+	err  error
+}
+
 // copyJob copies files and directory trees from one file system to another.
-// Call add for every source (this only plans), then run.
+// Call add for every source (this only plans), then run. A file that fails
+// is recorded and the rest continue; only cancellation or a lost connection
+// stops the job.
 type copyJob struct {
 	src, dst fileSystem
 	opts     copyOptions
 	prog     *progress
 	items    []copyItem
+
+	mu       sync.Mutex
 	skipped  []string // symlinked directories, broken links, devices, sockets...
+	failures []failure
 }
 
 func newCopyJob(src, dst fileSystem, opts copyOptions) *copyJob {
 	return &copyJob{src: src, dst: dst, opts: opts, prog: &progress{}}
+}
+
+func (j *copyJob) noteSkipped(p string) {
+	j.mu.Lock()
+	j.skipped = append(j.skipped, p)
+	j.mu.Unlock()
+}
+
+func (j *copyJob) fail(p string, err error) {
+	j.mu.Lock()
+	j.failures = append(j.failures, failure{p, err})
+	j.mu.Unlock()
+}
+
+func (j *copyJob) Skipped() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return append([]string(nil), j.skipped...)
+}
+
+func (j *copyJob) Failures() []failure {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return append([]failure(nil), j.failures...)
 }
 
 // add plans copying srcPath to exactly dstPath (not into it).
@@ -123,10 +186,10 @@ func (j *copyJob) plan(srcPath, dstPath string, info os.FileInfo) error {
 		j.prog.fileCount.Add(1)
 		return nil
 	case !info.IsDir():
-		j.skipped = append(j.skipped, srcPath)
+		j.noteSkipped(srcPath)
 		return nil
 	case !j.opts.recursive:
-		return fmt.Errorf("%s is a directory (use -r to copy folders)", srcPath)
+		return fmt.Errorf("%s is a directory", srcPath)
 	}
 
 	j.items = append(j.items, copyItem{srcPath, dstPath, info})
@@ -142,7 +205,7 @@ func (j *copyJob) plan(srcPath, dstPath string, info os.FileInfo) error {
 			// can't recurse forever.
 			target, err := j.src.Stat(childSrc)
 			if err != nil || target.IsDir() {
-				j.skipped = append(j.skipped, childSrc)
+				j.noteSkipped(childSrc)
 				continue
 			}
 			c = target
@@ -154,58 +217,179 @@ func (j *copyJob) plan(srcPath, dstPath string, info os.FileInfo) error {
 	return nil
 }
 
+// fatal reports errors that make carrying on pointless.
+func fatal(ctx context.Context, err error) bool {
+	return ctx.Err() != nil ||
+		errors.Is(err, sftp.ErrSSHFxConnectionLost) ||
+		errors.Is(err, sftp.ErrSSHFxNoConnection)
+}
+
+// under reports whether p is inside dir.
+func under(p, dir string) bool {
+	return len(p) > len(dir) && strings.HasPrefix(p, dir) && (p[len(dir)] == '/' || p[len(dir)] == '\\')
+}
+
 func (j *copyJob) run(ctx context.Context) error {
 	var dirs []copyItem
+	var failedDirs []string
 	for _, it := range j.items {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if it.info.IsDir() {
-			if err := j.dst.MkdirAll(it.dst); err != nil {
-				return fmt.Errorf("creating %s: %w", it.dst, err)
+		if len(failedDirs) > 0 && under(it.src, failedDirs[len(failedDirs)-1]) {
+			// Its folder could not be created; that failure is already listed.
+			if !it.info.IsDir() {
+				j.forget(it)
 			}
-			dirs = append(dirs, it)
 			continue
 		}
-		if err := j.copyFile(ctx, it); err != nil {
-			return err
+		var err error
+		if it.info.IsDir() {
+			if err = j.dst.MkdirAll(it.dst); err == nil {
+				dirs = append(dirs, it)
+			} else {
+				err = fmt.Errorf("creating folder %s: %w", it.dst, err)
+				failedDirs = append(failedDirs, it.src)
+			}
+		} else {
+			err = j.copyFile(ctx, it)
+		}
+		if err != nil {
+			if fatal(ctx, err) {
+				return err
+			}
+			j.fail(it.src, err)
 		}
 	}
 	j.prog.setCurrent("")
 
 	// Directory metadata goes last: writing files into a directory changes its mtime.
 	for i := len(dirs) - 1; i >= 0; i-- {
-		j.applyMeta(dirs[i])
+		j.applyMeta(dirs[i], dirs[i].dst)
 	}
 	return nil
 }
 
+// forget takes a file that won't be copied out of the totals.
+func (j *copyJob) forget(it copyItem) {
+	j.prog.total.Add(-it.info.Size())
+	j.prog.fileCount.Add(-1)
+}
+
 func (j *copyJob) copyFile(ctx context.Context, it copyItem) error {
 	j.prog.setCurrent(it.src)
+	dst := it.dst
+	existing, err := j.dst.Stat(dst)
+	if err == nil {
+		if existing.IsDir() {
+			return fmt.Errorf("%s is a folder on %s", dst, j.dst.Label())
+		}
+		action := j.opts.onConflict
+		if action == conflictAsk {
+			action = conflictOverwrite
+			if j.opts.ask != nil {
+				action = j.opts.ask(conflict{src: it.src, dst: dst, srcInfo: it.info, dstInfo: existing})
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		switch {
+		case action == conflictSkip,
+			action == conflictNewer && !newerThan(it.info.ModTime(), existing.ModTime()):
+			j.forget(it)
+			j.prog.kept.Add(1)
+			return nil
+		case action == conflictRename:
+			if dst, err = j.freeName(dst); err != nil {
+				return err
+			}
+			existing = nil
+			j.prog.renamed.Add(1)
+		}
+	} else {
+		existing = nil
+	}
+	if err := j.writeFile(ctx, it, dst, existing); err != nil {
+		return err
+	}
+	j.prog.files.Add(1)
+	return nil
+}
+
+// freeName finds "name (1).ext", "name (2).ext", ... that doesn't exist yet.
+func (j *copyJob) freeName(p string) (string, error) {
+	dir, base := j.dst.Dir(p), j.dst.Base(p)
+	stem, ext := base, ""
+	if i := strings.LastIndex(base, "."); i > 0 {
+		stem, ext = base[:i], base[i:]
+	}
+	for n := 1; n < 10000; n++ {
+		candidate := j.dst.Join(dir, fmt.Sprintf("%s (%d)%s", stem, n, ext))
+		if _, err := j.dst.Stat(candidate); err != nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("no free name for %s", p)
+}
+
+// writeFile copies into a hidden temporary file next to dst and renames it
+// into place, so an interrupted copy never damages an existing file. If the
+// folder doesn't allow creating files, it falls back to writing dst directly.
+func (j *copyJob) writeFile(ctx context.Context, it copyItem, dst string, existing os.FileInfo) error {
 	r, err := j.src.Open(it.src)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
-	w, err := j.dst.Create(it.dst)
+	tmp := j.dst.Join(j.dst.Dir(dst), "."+j.dst.Base(dst)+".gossh-"+strconv.FormatUint(uint64(rand.Uint32()), 36)+".part")
+	target := tmp
+	w, err := j.dst.Create(tmp)
 	if err != nil {
-		return fmt.Errorf("creating %s: %w", it.dst, err)
+		target = dst
+		if w, err = j.dst.Create(dst); err != nil {
+			return fmt.Errorf("creating %s: %w", dst, err)
+		}
 	}
+
 	err = j.stream(ctx, w, r, it.info.Size())
 	if cerr := w.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		j.dst.RemoveAll(it.dst) // don't leave a truncated file behind
+		j.dst.RemoveAll(target) // don't leave a partial file behind
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		return fmt.Errorf("copying %s: %w", it.src, err)
 	}
-	j.applyMeta(it)
-	j.prog.files.Add(1)
+
+	if existing != nil && target == tmp && j.dst.ModesMeaningful() {
+		// Replacing a file keeps its permissions unless asked to copy them.
+		j.dst.Chmod(tmp, existing.Mode().Perm())
+	}
+	j.applyMeta(it, target)
+	if target == tmp {
+		if err := j.replace(tmp, dst, existing != nil); err != nil {
+			j.dst.RemoveAll(tmp)
+			return fmt.Errorf("replacing %s: %w", dst, err)
+		}
+	}
 	return nil
+}
+
+// replace renames tmp over dst. Servers without the posix-rename extension
+// refuse to rename onto an existing file, so remove it first in that case.
+func (j *copyJob) replace(tmp, dst string, exists bool) error {
+	err := j.dst.Rename(tmp, dst)
+	if err == nil || !exists {
+		return err
+	}
+	if rmErr := j.dst.RemoveAll(dst); rmErr != nil {
+		return err
+	}
+	return j.dst.Rename(tmp, dst)
 }
 
 // stream copies r to w, letting the SFTP side drive so reads/writes are
@@ -227,12 +411,12 @@ func (j *copyJob) stream(ctx context.Context, w io.Writer, r io.Reader, size int
 
 // applyMeta copies permissions and modification time when asked to.
 // Failures are ignored, like scp: the data itself made it across.
-func (j *copyJob) applyMeta(it copyItem) {
+func (j *copyJob) applyMeta(it copyItem, p string) {
 	if j.opts.preserveMode && j.src.ModesMeaningful() {
-		j.dst.Chmod(it.dst, it.info.Mode().Perm())
+		j.dst.Chmod(p, it.info.Mode().Perm())
 	}
 	if j.opts.preserveTimes {
-		j.dst.Chtimes(it.dst, it.info.ModTime())
+		j.dst.Chtimes(p, it.info.ModTime())
 	}
 }
 
@@ -263,317 +447,4 @@ func percent(done, total int64) int {
 		return 100
 	}
 	return int(done * 100 / total)
-}
-
-// --- gossh cp ---
-
-// location is one gossh cp argument: a local path or host:path.
-type location struct {
-	host string // "" for local
-	path string
-}
-
-func parseLocation(s string) location {
-	return parseLocationFor(s, runtime.GOOS == "windows")
-}
-
-// parseLocationFor follows scp: "host:path" is remote when the colon comes
-// before any slash. "[::1]:path" and "user@[::1]:path" are IPv6 hosts and,
-// on Windows, "C:\..." is a drive letter.
-func parseLocationFor(s string, windows bool) location {
-	if open := strings.Index(s, "["); open >= 0 && (open == 0 || s[open-1] == '@') {
-		if end := strings.Index(s, "]:"); end > open {
-			return location{host: s[:open] + s[open+1:end], path: s[end+2:]}
-		}
-	}
-	colon := strings.Index(s, ":")
-	if colon <= 0 || strings.ContainsAny(s[:colon], `/\`) {
-		return location{path: s}
-	}
-	if windows && colon == 1 {
-		return location{path: s}
-	}
-	return location{host: s[:colon], path: s[colon+1:]}
-}
-
-type cpArgs struct {
-	recursive bool
-	preserve  bool
-	quiet     bool
-	sudo      bool
-	sshArgs   []string
-	paths     []string
-}
-
-// parseCpArgs accepts scp's common flags: -r -p -q (combinable, e.g. -rp),
-// -P port, -i key, -J jump, -o option, plus --sudo.
-func parseCpArgs(args []string) (cpArgs, error) {
-	var a cpArgs
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "--":
-			a.paths = append(a.paths, args[i+1:]...)
-			i = len(args)
-		case arg == "--sudo":
-			a.sudo = true
-		case arg == "-P" || arg == "-i" || arg == "-J" || arg == "-o":
-			if i+1 >= len(args) {
-				return a, fmt.Errorf("%s needs a value", arg)
-			}
-			i++
-			flag := arg
-			if arg == "-P" {
-				flag = "-p" // scp's -P is ssh's -p
-			}
-			a.sshArgs = append(a.sshArgs, flag, args[i])
-		case len(arg) > 1 && arg[0] == '-':
-			for _, c := range arg[1:] {
-				switch c {
-				case 'r', 'R':
-					a.recursive = true
-				case 'p':
-					a.preserve = true
-				case 'q':
-					a.quiet = true
-				default:
-					return a, fmt.Errorf("unknown option -%c", c)
-				}
-			}
-		default:
-			a.paths = append(a.paths, arg)
-		}
-	}
-	if len(a.paths) < 2 {
-		return a, fmt.Errorf("need a source and a destination")
-	}
-	return a, nil
-}
-
-func printCpUsage() {
-	fmt.Println("Usage: gossh cp [-r] [-p] [-q] [--sudo] [-P port] [-i key] [-J jump] SRC... DST")
-	fmt.Println()
-	fmt.Println("  gossh cp prod:/var/log/app.log .        download a file")
-	fmt.Println("  gossh cp -r ./dist prod:/srv/app        upload a folder")
-	fmt.Println(`  gossh cp "prod:/var/log/*.log" logs/    download matching files`)
-	fmt.Println("  gossh cp --sudo nginx.conf prod:/etc/nginx/   write where only root can")
-}
-
-func cpCommand(args []string) {
-	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
-		printCpUsage()
-		return
-	}
-	a, err := parseCpArgs(args)
-	if err != nil {
-		fmt.Println("Error:", err)
-		fmt.Println()
-		printCpUsage()
-		os.Exit(1)
-	}
-	if err := runCp(a); err != nil {
-		fmt.Println("Error:", err)
-		os.Exit(1)
-	}
-}
-
-// cpHost works out which host is involved and in which direction.
-func cpHost(srcs []location, dst location) (host string, download bool, err error) {
-	for _, s := range srcs {
-		if (s.host != "") != (srcs[0].host != "") {
-			return "", false, fmt.Errorf("sources mix local and remote paths")
-		}
-		if s.host != srcs[0].host {
-			return "", false, fmt.Errorf("all sources must be on the same host")
-		}
-	}
-	download = srcs[0].host != ""
-	switch {
-	case download && dst.host != "":
-		return "", false, fmt.Errorf("both sides are remote; one side must be a local path")
-	case !download && dst.host == "":
-		return "", false, fmt.Errorf("neither side is remote; write the remote side as host:path (e.g. prod:/tmp)")
-	case download:
-		return srcs[0].host, true, nil
-	}
-	return dst.host, false, nil
-}
-
-func runCp(a cpArgs) error {
-	srcs := make([]location, len(a.paths)-1)
-	for i, p := range a.paths[:len(a.paths)-1] {
-		srcs[i] = parseLocation(p)
-	}
-	dst := parseLocation(a.paths[len(a.paths)-1])
-	host, download, err := cpHost(srcs, dst)
-	if err != nil {
-		return err
-	}
-
-	sess, err := connectSFTP(host, connectOptions{sshArgs: a.sshArgs, sudo: a.sudo})
-	if err != nil {
-		return err
-	}
-	defer sess.Close()
-
-	var srcFS, dstFS fileSystem = localFS{}, sess.fs
-	if download {
-		srcFS, dstFS = sess.fs, localFS{}
-	}
-	srcPaths, err := expandSources(srcFS, srcs)
-	if err != nil {
-		return err
-	}
-	dstPath, err := dstFS.Abs(dst.path)
-	if err != nil {
-		return err
-	}
-	wantDir := strings.HasSuffix(dst.path, "/") || (!dstFS.Remote() && strings.HasSuffix(dst.path, `\`))
-	targets, err := cpTargets(srcFS, dstFS, srcPaths, dstPath, wantDir)
-	if err != nil {
-		return err
-	}
-
-	job := newCopyJob(srcFS, dstFS, copyOptions{
-		recursive:     a.recursive,
-		preserveTimes: a.preserve,
-		preserveMode:  a.preserve,
-	})
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	start := time.Now()
-	stopProgress := func() {}
-	if !a.quiet && term.IsTerminal(os.Stdout.Fd()) {
-		stopProgress = showProgress(job.prog, start)
-	}
-	err = func() error {
-		for _, t := range targets {
-			if err := job.add(t[0], t[1]); err != nil {
-				return err
-			}
-		}
-		return job.run(ctx)
-	}()
-	stopProgress()
-
-	for _, s := range job.skipped {
-		fmt.Printf("skipped %s (not a regular file, or a link to a directory)\n", s)
-	}
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return fmt.Errorf("cancelled; a partially written file may remain on %s", dstFS.Label())
-		}
-		return err
-	}
-	if !a.quiet {
-		fmt.Printf("%d file(s), %s in %s (%s)\n",
-			job.prog.files.Load(), formatSize(job.prog.done.Load()),
-			time.Since(start).Round(time.Millisecond), formatRate(job.prog.done.Load(), time.Since(start)))
-	}
-	return nil
-}
-
-func hasGlob(p string) bool { return strings.ContainsAny(p, "*?[") }
-
-// expandSources resolves each source to absolute paths, expanding wildcards
-// (so they work on remote paths and in shells that don't expand them).
-func expandSources(fsys fileSystem, locs []location) ([]string, error) {
-	var out []string
-	for _, l := range locs {
-		p, err := fsys.Abs(l.path)
-		if err != nil {
-			return nil, err
-		}
-		if _, statErr := fsys.Stat(p); statErr == nil || !hasGlob(l.path) {
-			out = append(out, p)
-			continue
-		}
-		matches, err := fsys.Glob(p)
-		if err != nil {
-			return nil, fmt.Errorf("bad pattern %q: %w", l.path, err)
-		}
-		if len(matches) == 0 {
-			return nil, fmt.Errorf("%s: no matches on %s", l.path, fsys.Label())
-		}
-		out = append(out, matches...)
-	}
-	return out, nil
-}
-
-// cpTargets follows cp/scp: sources go into dstPath if it is a directory,
-// otherwise a single source is copied to dstPath itself. A trailing slash
-// on the destination creates the directory when it is missing.
-func cpTargets(srcFS, dstFS fileSystem, srcPaths []string, dstPath string, wantDir bool) ([][2]string, error) {
-	info, err := dstFS.Stat(dstPath)
-	exists := err == nil
-	isDir := exists && info.IsDir()
-	if !isDir {
-		if exists && (wantDir || len(srcPaths) > 1) {
-			return nil, fmt.Errorf("%s is not a directory", dstPath)
-		}
-		if len(srcPaths) > 1 && !wantDir {
-			return nil, fmt.Errorf("%s does not exist (add a trailing / to create it)", dstPath)
-		}
-		if wantDir {
-			if err := dstFS.MkdirAll(dstPath); err != nil {
-				return nil, fmt.Errorf("creating %s: %w", dstPath, err)
-			}
-			isDir = true
-		}
-	}
-
-	targets := make([][2]string, len(srcPaths))
-	for i, s := range srcPaths {
-		targets[i] = [2]string{s, dstPath}
-		if isDir {
-			targets[i][1] = dstFS.Join(dstPath, srcFS.Base(s))
-		}
-	}
-	return targets, nil
-}
-
-// showProgress redraws a one-line progress report until the returned func is called.
-func showProgress(p *progress, start time.Time) func() {
-	done := make(chan struct{})
-	finished := make(chan struct{})
-	draw := func() {
-		width := 80
-		if w, _, err := term.GetSize(os.Stdout.Fd()); err == nil && w > 20 {
-			width = w
-		}
-		d, t := p.done.Load(), p.total.Load()
-		stats := fmt.Sprintf(" %3d%%  %s / %s  %s  [%d/%d]",
-			percent(d, t), formatSize(d), formatSize(t),
-			formatRate(d, time.Since(start)), p.files.Load(), p.fileCount.Load())
-		name := p.Current()
-		if room := width - len(stats) - 1; len(name) > room {
-			if room < 4 {
-				name = ""
-			} else {
-				name = "…" + name[len(name)-room+1:]
-			}
-		}
-		line := name + stats
-		fmt.Printf("\r%-*s", width-1, line)
-	}
-	go func() {
-		defer close(finished)
-		tick := time.NewTicker(200 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-done:
-				draw()
-				fmt.Println()
-				return
-			case <-tick.C:
-				draw()
-			}
-		}
-	}()
-	return func() {
-		close(done)
-		<-finished
-	}
 }

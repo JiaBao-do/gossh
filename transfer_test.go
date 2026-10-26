@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,79 +14,6 @@ import (
 	"github.com/pkg/sftp"
 )
 
-func TestParseLocation(t *testing.T) {
-	tests := []struct {
-		in      string
-		windows bool
-		want    location
-	}{
-		{"prod:/var/log", false, location{"prod", "/var/log"}},
-		{"prod:", false, location{"prod", ""}},
-		{"deploy@10.0.0.5:app.log", false, location{"deploy@10.0.0.5", "app.log"}},
-		{"[::1]:/tmp/x", false, location{"::1", "/tmp/x"}},
-		{"me@[fe80::1]:x", false, location{"me@fe80::1", "x"}},
-		{"./a:b", false, location{"", "./a:b"}},
-		{"dir/a:b", false, location{"", "dir/a:b"}},
-		{"file.txt", false, location{"", "file.txt"}},
-		{":x", false, location{"", ":x"}},
-		{`C:\Users\me\file`, true, location{"", `C:\Users\me\file`}},
-		{"C:/Users/me", true, location{"", "C:/Users/me"}},
-		{"c:/tmp", false, location{"c", "/tmp"}},
-		{"prod:/tmp", true, location{"prod", "/tmp"}},
-	}
-	for _, tt := range tests {
-		if got := parseLocationFor(tt.in, tt.windows); got != tt.want {
-			t.Errorf("parseLocationFor(%q, %v) = %+v, want %+v", tt.in, tt.windows, got, tt.want)
-		}
-	}
-}
-
-func TestParseCpArgs(t *testing.T) {
-	a, err := parseCpArgs([]string{"-rp", "-P", "2222", "--sudo", "-i", "k", "a", "b", "host:/x"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !a.recursive || !a.preserve || a.quiet || !a.sudo {
-		t.Errorf("flags = %+v", a)
-	}
-	if want := []string{"-p", "2222", "-i", "k"}; !reflect.DeepEqual(a.sshArgs, want) {
-		t.Errorf("sshArgs = %v, want %v", a.sshArgs, want)
-	}
-	if want := []string{"a", "b", "host:/x"}; !reflect.DeepEqual(a.paths, want) {
-		t.Errorf("paths = %v, want %v", a.paths, want)
-	}
-
-	for _, bad := range [][]string{{"-x", "a", "b"}, {"a"}, {"-P"}} {
-		if _, err := parseCpArgs(bad); err == nil {
-			t.Errorf("parseCpArgs(%v) should fail", bad)
-		}
-	}
-}
-
-func TestCpHost(t *testing.T) {
-	loc := parseLocationFor
-	if h, down, err := cpHost([]location{loc("prod:/a", false)}, loc(".", false)); err != nil || h != "prod" || !down {
-		t.Errorf("download: %q %v %v", h, down, err)
-	}
-	if h, down, err := cpHost([]location{loc("a", false), loc("b", false)}, loc("prod:/x", false)); err != nil || h != "prod" || down {
-		t.Errorf("upload: %q %v %v", h, down, err)
-	}
-	bad := []struct {
-		srcs []location
-		dst  location
-	}{
-		{[]location{loc("a", false)}, loc("b", false)},
-		{[]location{loc("p:/a", false)}, loc("q:/b", false)},
-		{[]location{loc("p:/a", false), loc("q:/b", false)}, loc(".", false)},
-		{[]location{loc("p:/a", false), loc("b", false)}, loc(".", false)},
-	}
-	for _, b := range bad {
-		if _, _, err := cpHost(b.srcs, b.dst); err == nil {
-			t.Errorf("cpHost(%v, %v) should fail", b.srcs, b.dst)
-		}
-	}
-}
-
 func writeFile(t *testing.T, p, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
@@ -96,6 +24,30 @@ func writeFile(t *testing.T, p, content string) {
 	}
 }
 
+// runCopy copies src to dst with opts and returns the finished job.
+func runCopy(t *testing.T, fsys fileSystem, src, dst string, opts copyOptions) *copyJob {
+	t.Helper()
+	job := newCopyJob(localFS{}, fsys, opts)
+	if err := job.add(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if err := job.run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return job
+}
+
+// noPartFiles fails if a temporary upload file was left behind in dir.
+func noPartFiles(t *testing.T, dir string) {
+	t.Helper()
+	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err == nil && strings.HasSuffix(p, ".part") {
+			t.Errorf("temporary file left behind: %s", p)
+		}
+		return nil
+	})
+}
+
 func TestCopyJobRecursive(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
 	writeFile(t, filepath.Join(src, "app", "a.txt"), "hello")
@@ -103,19 +55,14 @@ func TestCopyJobRecursive(t *testing.T) {
 	old := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
 	os.Chtimes(filepath.Join(src, "app", "a.txt"), old, old)
 
-	job := newCopyJob(localFS{}, localFS{}, copyOptions{recursive: true, preserveTimes: true})
-	if err := job.add(filepath.Join(src, "app"), filepath.Join(dst, "app")); err != nil {
-		t.Fatal(err)
-	}
-	if err := job.run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	job := runCopy(t, localFS{}, filepath.Join(src, "app"), filepath.Join(dst, "app"),
+		copyOptions{recursive: true, preserveTimes: true})
 
-	for name, want := range map[string]string{"a.txt": "hello", filepath.Join("sub", "b.txt"): "world!"} {
-		got, err := os.ReadFile(filepath.Join(dst, "app", name))
-		if err != nil || string(got) != want {
-			t.Errorf("%s = %q, %v; want %q", name, got, err, want)
-		}
+	if got := readFile(t, filepath.Join(dst, "app", "a.txt")); got != "hello" {
+		t.Errorf("a.txt = %q", got)
+	}
+	if got := readFile(t, filepath.Join(dst, "app", "sub", "b.txt")); got != "world!" {
+		t.Errorf("b.txt = %q", got)
 	}
 	if info, _ := os.Stat(filepath.Join(dst, "app", "a.txt")); !info.ModTime().Equal(old) {
 		t.Errorf("mtime = %v, want %v", info.ModTime(), old)
@@ -126,77 +73,163 @@ func TestCopyJobRecursive(t *testing.T) {
 	if f, n := job.prog.files.Load(), job.prog.fileCount.Load(); f != 2 || n != 2 {
 		t.Errorf("files = %d/%d, want 2/2", f, n)
 	}
+	noPartFiles(t, dst)
 }
 
 func TestCopyJobDirNeedsRecursive(t *testing.T) {
-	src := t.TempDir()
 	job := newCopyJob(localFS{}, localFS{}, copyOptions{})
-	err := job.add(src, filepath.Join(t.TempDir(), "x"))
-	if err == nil || !strings.Contains(err.Error(), "-r") {
-		t.Errorf("err = %v, want a hint about -r", err)
+	if err := job.add(t.TempDir(), filepath.Join(t.TempDir(), "x")); err == nil {
+		t.Error("copying a folder without recursive should fail")
 	}
 }
 
-func TestCopyJobCancel(t *testing.T) {
+func TestConflictActions(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "f.txt"), "new")
+	newTime := time.Now().Add(-time.Hour)
+	os.Chtimes(filepath.Join(src, "f.txt"), newTime, newTime)
+
+	tests := []struct {
+		action   conflictAction
+		dstAge   time.Duration // how much older the existing file is than the source
+		want     string        // content of f.txt afterwards
+		wantCopy string        // content of "f (1).txt", "" if it must not exist
+	}{
+		{conflictOverwrite, 0, "new", ""},
+		{conflictSkip, time.Hour, "old", ""},
+		{conflictNewer, time.Hour, "new", ""},     // source is newer: replaced
+		{conflictNewer, -time.Hour, "old", ""},    // existing is newer: kept
+		{conflictNewer, 0, "old", ""},             // same time: kept
+		{conflictRename, time.Hour, "old", "new"}, // keep both
+	}
+	for _, tt := range tests {
+		dst := t.TempDir()
+		target := filepath.Join(dst, "f.txt")
+		writeFile(t, target, "old")
+		dstTime := newTime.Add(-tt.dstAge)
+		os.Chtimes(target, dstTime, dstTime)
+
+		asked := 0
+		ask := func(c conflict) conflictAction {
+			asked++
+			if c.dst != target || c.dstInfo.Size() != 3 {
+				t.Errorf("conflict = %+v", c)
+			}
+			return tt.action
+		}
+		runCopy(t, localFS{}, filepath.Join(src, "f.txt"), target, copyOptions{onConflict: conflictAsk, ask: ask})
+
+		if asked != 1 {
+			t.Errorf("action %d: asked %d times", tt.action, asked)
+		}
+		if got := readFile(t, target); got != tt.want {
+			t.Errorf("action %d age %v: f.txt = %q, want %q", tt.action, tt.dstAge, got, tt.want)
+		}
+		copyPath := filepath.Join(dst, "f (1).txt")
+		if tt.wantCopy == "" {
+			if _, err := os.Stat(copyPath); err == nil {
+				t.Errorf("action %d: unexpected %s", tt.action, copyPath)
+			}
+		} else if got := readFile(t, copyPath); got != tt.wantCopy {
+			t.Errorf("action %d: copy = %q, want %q", tt.action, got, tt.wantCopy)
+		}
+		noPartFiles(t, dst)
+	}
+}
+
+func TestFreeName(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a.tar.gz"), "")
+	writeFile(t, filepath.Join(dir, "a.tar (1).gz"), "")
+	writeFile(t, filepath.Join(dir, ".env"), "")
+	j := newCopyJob(localFS{}, localFS{}, copyOptions{})
+	for in, want := range map[string]string{"a.tar.gz": "a.tar (2).gz", ".env": ".env (1)", "x": "x (1)"} {
+		if got, _ := j.freeName(filepath.Join(dir, in)); got != filepath.Join(dir, want) {
+			t.Errorf("freeName(%s) = %s, want %s", in, filepath.Base(got), want)
+		}
+	}
+}
+
+// cancelAfterFirstRead cancels the copy as soon as data starts flowing,
+// simulating the user pressing esc (or the network dying) mid-file.
+type cancelAfterFirstRead struct {
+	localFS
+	cancel context.CancelFunc
+}
+
+func (c cancelAfterFirstRead) Open(p string) (io.ReadCloser, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	return readCloser{Reader: io.MultiReader(io.LimitReader(f, 1), cancelReader{c.cancel}, f), Closer: f}, nil
+}
+
+type readCloser struct {
+	io.Reader
+	io.Closer
+}
+
+type cancelReader struct{ cancel context.CancelFunc }
+
+func (c cancelReader) Read([]byte) (int, error) {
+	c.cancel()
+	return 0, io.EOF
+}
+
+func TestCancelledOverwriteKeepsOriginal(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
 	writeFile(t, filepath.Join(src, "f"), strings.Repeat("x", 1<<20))
-	job := newCopyJob(localFS{}, localFS{}, copyOptions{})
+	writeFile(t, filepath.Join(dst, "f"), "original")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	job := newCopyJob(cancelAfterFirstRead{cancel: cancel}, localFS{}, copyOptions{onConflict: conflictOverwrite})
 	if err := job.add(filepath.Join(src, "f"), filepath.Join(dst, "f")); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := job.run(ctx); err == nil {
-		t.Fatal("expected cancellation error")
+	if err := job.run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if _, err := os.Stat(filepath.Join(dst, "f")); !os.IsNotExist(err) {
-		t.Errorf("partial file left behind: %v", err)
+	if got := readFile(t, filepath.Join(dst, "f")); got != "original" {
+		t.Errorf("existing file was damaged: %q", got[:min(len(got), 20)])
 	}
+	noPartFiles(t, dst)
 }
 
-func TestCpTargets(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "existing.txt"), "x")
-	fs := localFS{}
+// failOpen makes opening one particular file fail.
+type failOpen struct {
+	localFS
+	bad string
+}
 
-	got, err := cpTargets(fs, fs, []string{"/src/a.txt", "/src/b"}, dir, false)
-	if err != nil {
+func (f failOpen) Open(p string) (io.ReadCloser, error) {
+	if filepath.Base(p) == f.bad {
+		return nil, errors.New("simulated read error")
+	}
+	return os.Open(p)
+}
+
+func TestFailedFileDoesNotStopTheRest(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	writeFile(t, filepath.Join(src, "d", "a"), "a")
+	writeFile(t, filepath.Join(src, "d", "bad"), "b")
+	writeFile(t, filepath.Join(src, "d", "c"), "c")
+
+	job := newCopyJob(failOpen{bad: "bad"}, localFS{}, copyOptions{recursive: true})
+	if err := job.add(filepath.Join(src, "d"), filepath.Join(dst, "d")); err != nil {
 		t.Fatal(err)
 	}
-	want := [][2]string{{"/src/a.txt", filepath.Join(dir, "a.txt")}, {"/src/b", filepath.Join(dir, "b")}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("into dir: %v, want %v", got, want)
+	if err := job.run(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-
-	renamed := filepath.Join(dir, "new.txt")
-	if got, err := cpTargets(fs, fs, []string{"/src/a.txt"}, renamed, false); err != nil || got[0][1] != renamed {
-		t.Errorf("single file rename: %v %v", got, err)
+	fails := job.Failures()
+	if len(fails) != 1 || filepath.Base(fails[0].path) != "bad" {
+		t.Errorf("failures = %v", fails)
 	}
-
-	if _, err := cpTargets(fs, fs, []string{"a", "b"}, filepath.Join(dir, "missing"), false); err == nil {
-		t.Error("several sources into a missing dir should fail without a trailing slash")
-	}
-	if _, err := cpTargets(fs, fs, []string{"a", "b"}, filepath.Join(dir, "existing.txt"), false); err == nil {
-		t.Error("several sources into a file should fail")
-	}
-
-	created := filepath.Join(dir, "made")
-	if got, err := cpTargets(fs, fs, []string{"/src/a"}, created, true); err != nil || got[0][1] != filepath.Join(created, "a") {
-		t.Errorf("trailing slash: %v %v", got, err)
-	}
-}
-
-func TestExpandSourcesGlob(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "a.log"), "")
-	writeFile(t, filepath.Join(dir, "b.log"), "")
-	writeFile(t, filepath.Join(dir, "c.txt"), "")
-	got, err := expandSources(localFS{}, []location{{path: filepath.Join(dir, "*.log")}})
-	if err != nil || len(got) != 2 {
-		t.Errorf("glob = %v, %v", got, err)
-	}
-	if _, err := expandSources(localFS{}, []location{{path: filepath.Join(dir, "*.none")}}); err == nil {
-		t.Error("glob with no matches should fail")
+	for _, n := range []string{"a", "c"} {
+		if got := readFile(t, filepath.Join(dst, "d", n)); got != n {
+			t.Errorf("%s = %q", n, got)
+		}
 	}
 }
 
@@ -211,12 +244,8 @@ func TestListDirOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var names []string
-	for _, e := range entries {
-		names = append(names, e.name)
-	}
-	if want := []string{"..", "zdir", "A.txt", "b.txt"}; !reflect.DeepEqual(names, want) {
-		t.Errorf("names = %v, want %v", names, want)
+	if want := []string{"..", "zdir", "A.txt", "b.txt"}; !reflect.DeepEqual(entryNames(entries), want) {
+		t.Errorf("names = %v, want %v", entryNames(entries), want)
 	}
 	if entries, _ := listDir(localFS{}, dir, true); len(entries) != 5 {
 		t.Errorf("with hidden: %d entries, want 5", len(entries))
@@ -266,40 +295,35 @@ func pipeRemote(t *testing.T) *remoteFS {
 	return &remoteFS{c: client, host: "test", home: "/"}
 }
 
-// toSlash turns a local temp path into what the in-process server expects.
-func toSlash(p string) string { return filepath.ToSlash(p) }
-
 func TestCopyJobOverSFTP(t *testing.T) {
 	remote := pipeRemote(t)
 	local, srv := t.TempDir(), t.TempDir()
 	big := strings.Repeat("0123456789abcdef", 1<<16) // 1 MiB: many concurrent packets
 	writeFile(t, filepath.Join(local, "up", "big.bin"), big)
 	writeFile(t, filepath.Join(local, "up", "nested", "small.txt"), "hi")
+	writeFile(t, filepath.Join(srv, "up", "nested", "small.txt"), "old remote")
 
-	up := newCopyJob(localFS{}, remote, copyOptions{recursive: true, preserveTimes: true})
-	if err := up.add(filepath.Join(local, "up"), toSlash(filepath.Join(srv, "up"))); err != nil {
-		t.Fatal(err)
-	}
-	if err := up.run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := os.ReadFile(filepath.Join(srv, "up", "big.bin")); string(got) != big {
+	// Upload, overwriting the existing remote file through the temp-file rename.
+	runCopy(t, remote, filepath.Join(local, "up"), filepath.ToSlash(filepath.Join(srv, "up")),
+		copyOptions{recursive: true, preserveTimes: true, onConflict: conflictOverwrite})
+	if got := readFile(t, filepath.Join(srv, "up", "big.bin")); got != big {
 		t.Fatalf("uploaded big.bin differs (%d bytes)", len(got))
 	}
+	if got := readFile(t, filepath.Join(srv, "up", "nested", "small.txt")); got != "hi" {
+		t.Fatalf("remote small.txt = %q, want overwritten", got)
+	}
+	noPartFiles(t, srv)
 
 	down := newCopyJob(remote, localFS{}, copyOptions{recursive: true})
 	back := filepath.Join(local, "back")
-	if err := down.add(toSlash(filepath.Join(srv, "up")), back); err != nil {
+	if err := down.add(filepath.ToSlash(filepath.Join(srv, "up")), back); err != nil {
 		t.Fatal(err)
 	}
 	if err := down.run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(filepath.Join(back, "big.bin")); string(got) != big {
+	if got := readFile(t, filepath.Join(back, "big.bin")); got != big {
 		t.Fatalf("downloaded big.bin differs (%d bytes)", len(got))
-	}
-	if got, _ := os.ReadFile(filepath.Join(back, "nested", "small.txt")); string(got) != "hi" {
-		t.Fatalf("small.txt = %q", got)
 	}
 	if d, total := down.prog.done.Load(), down.prog.total.Load(); d != total || total != int64(len(big)+2) {
 		t.Errorf("download progress %d/%d", d, total)

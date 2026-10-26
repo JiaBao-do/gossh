@@ -1,7 +1,8 @@
 # gossh
 
-A terminal UI for managing and connecting to SSH hosts in `~/.ssh/config`,
-with port forwarding and FileZilla-style file transfer.
+A terminal UI for your SSH hosts in `~/.ssh/config`: connect, transfer files
+(FileZilla-style, two panes with a transfer queue), port forwarding and key
+management, all from one screen.
 
 ## Install
 
@@ -43,97 +44,105 @@ uses the binary next to it instead of downloading.
 
 ## Usage
 
+Run `gossh`. Everything happens from its host list; you don't need to
+remember any commands. After each action you come back to the list, with a
+line at the bottom saying what happened.
+
 ```
-gossh                    interactive host picker
-                         (enter = connect, f = forward, t = files, e = edit, a = add, / = filter)
-gossh prod-db            connect to a saved host
-gossh prod-db -A         any ssh flags pass straight through
+enter   connect                     a   add a host
+t       transfer files              e   edit the selected host
+s       transfer files as root      d   delete the selected host
+f       port forwarding             k   keys (import, move into ~/.ssh/keys)
+/       filter the list             u   upgrade gossh
+?       show all keys               q   quit
+```
+
+A few shortcuts still work from the shell:
+
+```
+gossh prod-db            connect straight to a saved host (any ssh flags pass through)
 gossh user@1.2.3.4       plain ssh
-gossh list | add | edit [alias] | delete
+gossh upgrade            install the latest release (same as u in gossh)
 gossh version
 ```
 
-### Port forwarding
+### Hosts and keys
 
-Run `gossh forward` (or press `f` in the picker) for a guided setup, or give
-the specs directly:
+`a` and `e` open a form for the alias, HostName, User and Port, then a key
+picker that lists:
 
-```
-gossh forward prod-db 8080              localhost:8080 -> localhost:8080 on prod-db
-gossh forward prod-db 5433:5432         localhost:5433 -> localhost:5432 on prod-db
-gossh forward prod-db 5433:db.internal:5432   reach a host only prod-db can see
-gossh forward prod-db R:9000:3000       prod-db:9000 -> your localhost:3000
-gossh forward prod-db D:1080            SOCKS5 proxy on localhost:1080
-gossh forward prod-db 8080:80 D:1080    several at once
-```
+- the keys already in `~/.ssh/keys`
+- private keys found in `~/.ssh`, `Downloads` and `Desktop` (e.g. a `.pem`
+  you just downloaded)
+- **Browse for a key file...** (a file picker) and **Type a path...**
 
-Ctrl+C stops it. Busy local ports are reported before connecting.
-
-### File transfer
-
-Transfers use SFTP over your system `ssh`, so everything in `~/.ssh/config`
-(aliases, keys, agents, `ProxyJump`, password prompts) works exactly as it
-does for `gossh <alias>`. The server only needs SFTP enabled, which is the
-OpenSSH default.
-
-**Browser:** `gossh files prod` (or `t` in the picker) opens two panes: this
-machine on the left and the host on the right.
-
-```
-tab        switch pane            space      mark / unmark (a = all)
-enter / →  open folder            c / F5     copy marked (or current) to the other pane
-⌫ / ←      parent folder          d / F8     delete       r / F2   rename
-g          go to a path           m / F7     new folder   .        show hidden
-~          home folder            esc        cancel the running transfer
-```
-
-Folders are copied recursively, existing files are only overwritten after
-you confirm, and a progress bar with speed shows at the bottom.
-
-**Command line:** `gossh cp` works like `scp`. Remote paths are `alias:path`
-(or `user@host:path`); relative remote paths start in your home folder.
-
-```
-gossh cp prod:/var/log/app.log .            download a file
-gossh cp report.pdf prod:                   upload into your home folder
-gossh cp -r ./dist prod:/srv/app            upload a folder (-r needed for folders)
-gossh cp -r prod:/srv/app/config ./backup/  trailing / creates the folder if missing
-gossh cp "prod:/var/log/*.log" logs/        wildcards (quote them for remote paths)
-gossh cp a.txt b.txt prod:/tmp              several files at once
-gossh cp -p ...                             keep modification times and permissions
-gossh cp -P 2222 -i key.pem f user@1.2.3.4:/tmp   scp-style -P / -i / -J / -o
-```
-
-**Root-owned paths:** add `--sudo` to `gossh cp` or `gossh files` to run the
-remote SFTP server through `sudo`, e.g.
-`gossh cp --sudo nginx.conf prod:/etc/nginx/`. Passwordless sudo is used
-when available; otherwise gossh asks for the sudo password. Files written
-this way are owned by root. Hosts whose sudoers has `requiretty` are not
-supported.
-
-### Keys
-
-All gossh-managed keys live in `~/.ssh/keys/`. The IdentityFile field accepts
-a key name from that folder (Tab autocompletes) or a path to any key file.
-
-**Existing configs are left alone.** Hosts that already point at keys
-elsewhere keep working and are not changed until you decide:
-
-- When you enter a key outside `~/.ssh/keys` you choose **Copy** (keep the
-  original), **Move** (remove the original) or **Keep** (reference it where it is).
-- `gossh keys migrate` lists every host using an outside key and lets you
-  pick hosts, then Copy / Move / Keep in one go. A key still used by another
-  host (or a `Host *` / `Match` block) is never deleted.
-
-```
-gossh keys                              list managed keys
-gossh keys import ~/Downloads/prod.pem  copy a key in (add --move to move it)
-gossh keys migrate                      bring existing hosts' keys into ~/.ssh/keys
-```
+When the key is outside `~/.ssh/keys` you choose **Copy** (keep the
+original), **Move** (remove the original) or **Keep** (use it where it is).
+Hosts that already point at keys elsewhere keep working and are never
+changed until you decide; `k` → *Bring keys my hosts use from other
+folders* moves them in one go. A key still used by another host (or a
+`Host *` / `Match` block) is never deleted.
 
 Imported keys get owner-only permissions (on Windows the ACL is locked down
 too, which OpenSSH requires) and their `.pub` is brought along. The config
 references `~/.ssh/keys/<name>`, which works on every OS.
+
+### Port forwarding
+
+Select a host and press `f`. Pick what you want:
+
+- **Access a remote service here** (`-L`): e.g. the server's database on your localhost:5433
+- **Expose a local service on the server** (`-R`): e.g. the server's port 9000 reaches your localhost:3000
+- **SOCKS proxy** (`-D`): browse through the server
+
+Busy local ports are reported before connecting. Ctrl+C stops the forward
+and brings you back to gossh.
+
+### File transfer
+
+Select a host and press `t` (or `s` to work as root through `sudo`, e.g. to
+edit files under `/etc`). Transfers use SFTP over your system `ssh`, so
+everything in `~/.ssh/config` (keys, agents, `ProxyJump`, password
+prompts) works the same as connecting. The server only needs SFTP enabled,
+which is the OpenSSH default.
+
+The left pane is this computer, the right pane is the host, and the
+**Transfers** panel underneath shows every copy with its progress.
+
+- **Copy a file or a whole folder:** put the cursor on it and press `c`.
+  It goes into the folder open in the other pane; folders are copied with
+  everything inside.
+- **Copy several things:** mark them with `space` (they turn yellow), then `c`.
+- **Copy only what is inside a folder:** open the folder, press `a` to mark
+  everything, then `c`.
+- **If a file already exists** you choose: `o` overwrite, `n` overwrite only
+  if newer, `s` skip, `r` keep both (saved as `file (1).txt`). Shift + the
+  letter applies the answer to the rest of the queue.
+
+Copies are written under a temporary name and swapped in at the end, so a
+cancelled or broken transfer never damages the file that was already there.
+One failed file doesn't stop the rest: the Transfers panel marks it, `enter`
+shows why and `r` retries.
+
+```
+tab        pane / transfers panel   space      mark / unmark (a = all)
+enter / →  open folder              c / F5     copy to the other pane
+⌫ / ←      parent folder            d / F8     delete       r / F2   rename
+g          go to a path             m / F7     new folder   .        show hidden
+~          home folder              esc        cancel the running transfer
+?          help (inside the file manager)
+```
+
+With `s` (sudo), passwordless sudo is used when available; otherwise gossh
+asks for the sudo password. Files written this way are owned by root. Hosts
+whose sudoers has `requiretty` are not supported.
+
+### Upgrading
+
+Press `u` in gossh (or run `gossh upgrade`). It downloads the latest release
+for your OS/CPU from GitHub, checks it against the published checksums and
+replaces itself. Coming from v1.1.0 or older, run the install command once
+more; those versions don't have the upgrade command yet.
 
 ### Your existing ~/.ssh/config is safe
 

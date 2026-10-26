@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 
@@ -114,48 +113,16 @@ func portFree(port string) bool {
 	return true
 }
 
-// forwardCommand implements "gossh forward [host [spec...]]".
-func forwardCommand(configPath string, args []string) {
-	if len(args) == 0 {
-		forwardInteractive(configPath, "")
-		return
-	}
-	host, rest := args[0], args[1:]
-	if len(rest) == 0 {
-		forwardInteractive(configPath, host)
-		return
-	}
-
-	var specs []string
-	for i := 0; i < len(rest); i++ {
-		a := rest[i]
-		prefix := map[string]string{"-L": "L:", "-R": "R:", "-D": "D:", "--local": "L:", "--remote": "R:", "--socks": "D:"}[a]
-		if prefix != "" {
-			if i+1 >= len(rest) {
-				fmt.Printf("%s needs a value\n", a)
-				os.Exit(1)
-			}
-			i++
-			specs = append(specs, prefix+rest[i])
-			continue
-		}
-		specs = append(specs, a)
-	}
-	startForwards(host, specs)
-}
-
 // startForwards validates specs and runs ssh until the user presses Ctrl+C.
-func startForwards(host string, specs []string) {
+func startForwards(host string, specs []string) (string, error) {
 	var fwds []forward
 	for _, s := range specs {
 		f, err := parseForwardSpec(s, host)
 		if err != nil {
-			fmt.Println("Error:", err)
-			os.Exit(1)
+			return "", err
 		}
 		if f.local != "" && !portFree(f.local) {
-			fmt.Printf("Error: local port %s is already in use. Pick another one.\n", f.local)
-			os.Exit(1)
+			return "", fmt.Errorf("local port %s is already in use; pick another one", f.local)
 		}
 		fwds = append(fwds, f)
 	}
@@ -167,20 +134,16 @@ func startForwards(host string, specs []string) {
 		sshArgs = append(sshArgs, f.flag, f.value)
 	}
 	sshArgs = append(sshArgs, host)
-	fmt.Printf("Command: gossh forward %s %s\n", host, strings.Join(specs, " "))
-	fmt.Println("Press Ctrl+C to stop.")
-	runSSH(sshArgs...)
+	fmt.Println("Press Ctrl+C to stop and go back to gossh.")
+	if code := runSSH(sshArgs...); code == 255 {
+		waitForEnter()
+		return "", fmt.Errorf("forwarding through %s failed (see the ssh message)", host)
+	}
+	return "Stopped forwarding through " + host, nil
 }
 
 // forwardInteractive guides the user through a single forward.
-func forwardInteractive(configPath, host string) {
-	if host == "" {
-		var ok bool
-		if host, ok = chooseHost(configPath, "Forward through which host?"); !ok {
-			return
-		}
-	}
-
+func forwardInteractive(host string) (string, error) {
 	kind := "L"
 	if err := huh.NewSelect[string]().
 		Title("What do you want to do?").
@@ -191,7 +154,7 @@ func forwardInteractive(configPath, host string) {
 		).
 		Value(&kind).
 		Run(); err != nil {
-		return
+		return "", err
 	}
 
 	var spec string
@@ -210,7 +173,7 @@ func forwardInteractive(configPath, host string) {
 				Value(&local).
 				Validate(optionalPort),
 		)).Run(); err != nil {
-			return
+			return "", err
 		}
 		h, p := splitTarget(target)
 		if local == "" {
@@ -231,7 +194,7 @@ func forwardInteractive(configPath, host string) {
 				Value(&remote).
 				Validate(optionalPort),
 		)).Run(); err != nil {
-			return
+			return "", err
 		}
 		h, p := splitTarget(target)
 		if remote == "" {
@@ -246,29 +209,12 @@ func forwardInteractive(configPath, host string) {
 			Value(&port).
 			Validate(validPort).
 			Run(); err != nil {
-			return
+			return "", err
 		}
 		spec = "D:" + port
 	}
 
-	startForwards(host, []string{spec})
-}
-
-// chooseHost picks a saved host, or asks for alias/user@host when none are saved.
-func chooseHost(configPath, title string) (string, bool) {
-	entries, err := parseConfig(configPath)
-	if err != nil {
-		fmt.Println("Error parsing config:", err)
-		return "", false
-	}
-	if len(hosts(entries)) > 0 {
-		return selectHost(entries, title)
-	}
-	var host string
-	if err := huh.NewInput().Title("Host (alias or user@host)").Value(&host).Validate(required("host")).Run(); err != nil {
-		return "", false
-	}
-	return host, true
+	return startForwards(host, []string{spec})
 }
 
 // splitTarget accepts "host:port" or a bare port (meaning localhost).

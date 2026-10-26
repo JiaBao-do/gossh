@@ -152,8 +152,9 @@ const sftpServerScript = `for p in /usr/lib/openssh/sftp-server /usr/libexec/ope
 	`echo "gossh: sftp-server not found on the remote host" >&2; exit 127`
 
 type connectOptions struct {
-	sshArgs []string // extra ssh flags, e.g. -P/-i from gossh cp
-	sudo    bool     // run sftp-server through sudo (root access)
+	sudo bool // run sftp-server through sudo (root access)
+	// sshArgs are extra ssh flags; only tests use them, to reach a test server.
+	sshArgs []string
 }
 
 // stderrTap shows ssh's stderr while connecting and keeps the tail of it.

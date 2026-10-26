@@ -1,13 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -36,13 +36,21 @@ func (e SSHEntry) FilterValue() string { return e.Alias + e.HostName + e.User }
 // --- Main ---
 
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
+	cleanupOldBinary()
+	args := os.Args[1:]
+	if len(args) > 0 {
+		switch args[0] {
 		case "version", "--version", "-v":
 			fmt.Printf("gossh %s\n", version)
 			return
 		case "help", "--help", "-h":
 			printHelp()
+			return
+		case "upgrade", "update":
+			if err := upgradeCLI(); err != nil {
+				fmt.Println("Error:", err)
+				os.Exit(1)
+			}
 			return
 		}
 	}
@@ -52,104 +60,36 @@ func main() {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
-
-	args := os.Args[1:]
-	mode := "interactive"
-	if len(args) > 0 {
-		mode = args[0]
+	if len(args) == 0 {
+		runMenu(configPath)
+		return
 	}
-
-	switch mode {
-	case "list":
-		listHostsCLI(configPath)
-	case "add":
-		addHost(configPath)
-	case "edit":
-		alias := ""
-		if len(args) > 1 {
-			alias = args[1]
-		}
-		editHost(configPath, alias)
-	case "delete":
-		deleteHost(configPath)
-	case "keys", "key":
-		keysCommand(configPath, args[1:])
-	case "forward", "fwd":
-		forwardCommand(configPath, args[1:])
-	case "cp", "scp":
-		cpCommand(args[1:])
-	case "files", "browse", "sftp":
-		filesCommand(configPath, args[1:])
-	case "connect":
-		if len(args) < 2 {
-			fmt.Println("Usage: gossh connect <alias|user@host> [ssh args...]")
-			os.Exit(1)
-		}
-		runSSH(args[1:]...)
-	case "interactive":
-		runTUI(configPath)
-	default:
-		// Anything else is handed to ssh: "gossh prod-db", "gossh user@host -p 2222".
-		runSSH(args...)
-	}
+	// "gossh prod-db", "gossh user@host -p 2222": straight to ssh.
+	os.Exit(runSSH(args...))
 }
 
 func printHelp() {
 	fmt.Println("gossh - SSH host manager")
 	fmt.Println()
-	fmt.Println("Usage:")
-	fmt.Println("  gossh                       Launch interactive TUI")
-	fmt.Println("  gossh <alias> [args]        Connect to a saved host (any ssh args work)")
-	fmt.Println("  gossh user@host [args]      Plain ssh passthrough")
-	fmt.Println("  gossh connect <alias>       Connect (use if an alias clashes with a command)")
-	fmt.Println("  gossh list                  List all saved hosts")
-	fmt.Println("  gossh add                   Add a new host")
-	fmt.Println("  gossh edit [alias]          Edit a host (select or specify by alias)")
-	fmt.Println("  gossh delete                Delete a host")
+	fmt.Println("  gossh                   Open gossh. Everything is done from there: connect,")
+	fmt.Println("                          transfer files, port forwarding, add/edit/delete hosts, keys")
+	fmt.Println("  gossh <alias> [args]    Connect straight to a saved host (any ssh args work)")
+	fmt.Println("  gossh user@host [args]  Plain ssh")
+	fmt.Println("  gossh upgrade           Install the latest gossh release")
+	fmt.Println("  gossh version           Show version")
 	fmt.Println()
-	fmt.Println("Port forwarding:")
-	fmt.Println("  gossh forward               Guided port forward (pick host and ports)")
-	fmt.Println("  gossh forward <alias> SPEC...")
-	fmt.Println("      8080                    localhost:8080 -> remote localhost:8080")
-	fmt.Println("      8080:80                 localhost:8080 -> remote localhost:80")
-	fmt.Println("      5433:db.internal:5432   localhost:5433 -> db.internal:5432 (seen from remote)")
-	fmt.Println("      R:9000:3000             remote port 9000 -> your localhost:3000")
-	fmt.Println("      D:1080                  SOCKS proxy on localhost:1080 through the host")
+	fmt.Println("Keys in gossh:")
+	fmt.Println("  enter  connect           t  transfer files       s  transfer files as root (sudo)")
+	fmt.Println("  f      port forwarding   a  add host             e  edit host")
+	fmt.Println("  d      delete host       k  manage keys          u  upgrade gossh")
+	fmt.Println("  /      filter            ?  more keys            q  quit")
 	fmt.Println()
-	fmt.Println("File transfer (SFTP, uses your ~/.ssh/config like ssh does):")
-	fmt.Println("  gossh files [alias] [dir]   Two-pane file browser (local | remote)")
-	fmt.Println("  gossh cp SRC... DST         Copy files, scp style; remote paths are alias:path")
-	fmt.Println("      prod:/var/log/app.log . download a file")
-	fmt.Println("      -r ./dist prod:/srv/app upload a folder (-r copies folders)")
-	fmt.Println("      \"prod:/var/log/*.log\" . wildcards work on both sides")
-	fmt.Println("      -p                      keep modification times and permissions")
-	fmt.Println("      -P port -i key -J jump  as in scp, for user@host targets")
-	fmt.Println("  --sudo                      (cp and files) act as root on the remote host")
-	fmt.Println()
-	fmt.Println("Keys (stored in ~/.ssh/keys):")
-	fmt.Println("  gossh keys                  List managed keys")
-	fmt.Println("  gossh keys import <path>    Copy a key into ~/.ssh/keys")
-	fmt.Println("  gossh keys migrate          Copy/move keys that hosts reference elsewhere")
-	fmt.Println()
-	fmt.Println("  gossh version               Show version")
-	fmt.Println("  gossh help                  Show this help")
-	fmt.Println()
-	fmt.Println("Existing hosts are never changed automatically. When you set an IdentityFile")
-	fmt.Println("outside ~/.ssh/keys you choose to copy it, move it, or keep it where it is.")
-	fmt.Println("~/.ssh/config is backed up to ~/.ssh/config.bak before every change.")
-	fmt.Println()
-	fmt.Println("Interactive TUI keys:")
-	fmt.Println("  enter                       Connect to selected host")
-	fmt.Println("  f                           Port forward through selected host")
-	fmt.Println("  t                           Browse / transfer files on selected host")
-	fmt.Println("  e                           Edit selected host")
-	fmt.Println("  a                           Add a new host")
-	fmt.Println("  /                           Filter hosts")
-	fmt.Println("  ctrl+c  q                   Quit")
+	fmt.Println("Existing hosts are never changed automatically, and ~/.ssh/config is backed")
+	fmt.Println("up to ~/.ssh/config.bak before every change.")
 }
 
-// runSSH runs the system ssh client with the given arguments and exits with its status.
-func runSSH(args ...string) {
+// runSSH runs the system ssh client with the given arguments and returns its exit code.
+func runSSH(args ...string) int {
 	sshPath := sshBinary()
 
 	// ssh handles Ctrl+C itself (e.g. to stop a forward); don't let it kill gossh first.
@@ -161,22 +101,51 @@ func runSSH(args ...string) {
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+			return exitErr.ExitCode()
 		}
 		fmt.Println("Error:", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
+}
+
+// waitForEnter keeps output (like an ssh error) on screen before the menu
+// takes the terminal back.
+func waitForEnter() {
+	fmt.Print("\nPress enter to go back to gossh...")
+	fmt.Scanln()
 }
 
 // --- Bubble Tea TUI (The Main Menu) ---
 
-var docStyle = lipgloss.NewStyle().Margin(1, 2)
+var (
+	docStyle       = lipgloss.NewStyle().Margin(1, 2)
+	menuOKStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#87D787"))
+	menuErrorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F5F"))
+)
 
 type model struct {
-	list     list.Model
-	selected *SSHEntry
-	action   string // "connect", "edit", "add", "forward" or "files"
-	quitting bool
+	list      list.Model
+	selected  string // alias the action applies to
+	action    string // "" means quit
+	status    string
+	statusErr bool
+}
+
+// menuActions maps keys to actions; the bool says whether a host must be selected.
+var menuActions = map[string]struct {
+	action    string
+	needsHost bool
+}{
+	"enter": {"connect", true},
+	"t":     {"files", true},
+	"s":     {"files-sudo", true},
+	"f":     {"forward", true},
+	"e":     {"edit", true},
+	"d":     {"delete", true},
+	"a":     {"add", false},
+	"k":     {"keys", false},
+	"u":     {"upgrade", false},
 }
 
 func (m model) Init() tea.Cmd {
@@ -187,32 +156,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
-			m.quitting = true
 			return m, tea.Quit
 		}
-		if msg.String() == "enter" {
-			if i, ok := m.list.SelectedItem().(SSHEntry); ok {
-				m.selected = &i
-				m.action = "connect"
-				return m, tea.Quit
-			}
-		}
-		if !m.list.SettingFilter() {
-			switch msg.String() {
-			case "e", "f", "t":
-				if i, ok := m.list.SelectedItem().(SSHEntry); ok {
-					m.selected = &i
-					m.action = map[string]string{"e": "edit", "f": "forward", "t": "files"}[msg.String()]
-					return m, tea.Quit
+		if a, ok := menuActions[msg.String()]; ok && !m.list.SettingFilter() {
+			if a.needsHost {
+				i, ok := m.list.SelectedItem().(SSHEntry)
+				if !ok {
+					m.status, m.statusErr = "No host selected. Press a to add one.", true
+					return m, nil
 				}
-			case "a":
-				m.action = "add"
-				return m, tea.Quit
+				m.selected = i.Alias
 			}
+			m.action = a.action
+			return m, tea.Quit
 		}
 	case tea.WindowSizeMsg:
 		h, v := docStyle.GetFrameSize()
-		m.list.SetSize(msg.Width-h, msg.Height-v)
+		m.list.SetSize(msg.Width-h, msg.Height-v-1)
 	}
 
 	var cmd tea.Cmd
@@ -221,77 +181,113 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	if m.action != "" || m.quitting {
+	if m.action != "" {
 		return ""
 	}
-	return docStyle.Render(m.list.View())
+	status := menuOKStyle.Render(m.status)
+	if m.statusErr {
+		status = menuErrorStyle.Render(m.status)
+	}
+	return docStyle.Render(m.list.View() + "\n" + status)
 }
 
-func runTUI(path string) {
-	entries, err := parseConfig(path)
-	if err != nil {
-		fmt.Println("Error parsing config:", err)
-		return
-	}
-
-	// Convert SSHEntry to []list.Item
+// pickHost shows the host list until the user picks an action.
+func pickHost(entries []SSHEntry, status string, statusErr bool) (action, alias string, err error) {
 	visible := hosts(entries)
 	items := make([]list.Item, len(visible))
 	for i, e := range visible {
 		items[i] = e
 	}
 
-	// Setup List
 	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
 	l.Title = "SSH Servers"
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
+	l.SetStatusBarItemName("host", "hosts")
 	l.Styles.Title = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFF")).Background(lipgloss.Color("#7D56F4")).Padding(0, 1)
 
-	connectKey := key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "connect"))
-	forwardKey := key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "forward"))
-	filesKey := key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "files"))
-	editKey := key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit"))
-	addKey := key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add"))
-	bindings := []key.Binding{connectKey, forwardKey, filesKey, editKey, addKey}
-	l.AdditionalShortHelpKeys = func() []key.Binding { return bindings }
-	l.AdditionalFullHelpKeys = func() []key.Binding { return bindings }
+	// Free up k/d/u/f/b (the list's vim-style defaults) for gossh actions.
+	l.KeyMap.CursorUp = key.NewBinding(key.WithKeys("up"), key.WithHelp("↑", "up"))
+	l.KeyMap.CursorDown = key.NewBinding(key.WithKeys("down"), key.WithHelp("↓", "down"))
+	l.KeyMap.PrevPage = key.NewBinding(key.WithKeys("left", "pgup"), key.WithHelp("←/pgup", "prev page"))
+	l.KeyMap.NextPage = key.NewBinding(key.WithKeys("right", "pgdown"), key.WithHelp("→/pgdn", "next page"))
 
-	m := model{list: l}
-
-	// Run Bubble Tea Program
-	p := tea.NewProgram(m, tea.WithAltScreen())
-	finalModel, err := p.Run()
-	if err != nil {
-		fmt.Println("Error running TUI:", err)
-		os.Exit(1)
+	bind := func(k, help string) key.Binding {
+		return key.NewBinding(key.WithKeys(k), key.WithHelp(k, help))
 	}
+	short := []key.Binding{bind("enter", "connect"), bind("t", "files"), bind("f", "forward"), bind("a", "add"), bind("e", "edit")}
+	full := append(short, bind("s", "files as root"), bind("d", "delete"), bind("k", "keys"), bind("u", "upgrade gossh"))
+	l.AdditionalShortHelpKeys = func() []key.Binding { return short }
+	l.AdditionalFullHelpKeys = func() []key.Binding { return full }
 
-	if finalM, ok := finalModel.(model); ok {
-		switch finalM.action {
+	if status == "" && len(visible) == 0 {
+		status = "No hosts yet. Press a to add one."
+	}
+	final, err := tea.NewProgram(model{list: l, status: status, statusErr: statusErr}, tea.WithAltScreen()).Run()
+	if err != nil {
+		return "", "", err
+	}
+	m := final.(model)
+	return m.action, m.selected, nil
+}
+
+// runMenu is gossh's home screen: pick a host and an action, do it, come back.
+func runMenu(path string) {
+	status, statusErr := "", false
+	for {
+		entries, err := parseConfig(path)
+		if err != nil {
+			fmt.Println("Error parsing config:", err)
+			os.Exit(1)
+		}
+		action, alias, err := pickHost(entries, status, statusErr)
+		if err != nil {
+			fmt.Println("Error running TUI:", err)
+			os.Exit(1)
+		}
+		if action == "" {
+			return
+		}
+
+		var msg string
+		switch action {
 		case "connect":
-			if finalM.selected == nil {
-				return
+			fmt.Printf("Connecting to %s...\n", alias)
+			code := runSSH(alias)
+			msg = "Disconnected from " + alias
+			if code == 255 {
+				// ssh's own failure (unreachable, auth...); keep its message visible.
+				waitForEnter()
+				err = fmt.Errorf("could not connect to %s", alias)
 			}
-			fmt.Printf("Connecting to %s (%s)...\n", finalM.selected.Alias, finalM.selected.HostName)
-			runSSH(finalM.selected.Alias)
+		case "files", "files-sudo":
+			if err = runFiles(alias, "", action == "files-sudo"); err != nil {
+				waitForEnter()
+			}
 		case "forward":
-			if finalM.selected == nil {
-				return
-			}
-			forwardInteractive(path, finalM.selected.Alias)
-		case "files":
-			if finalM.selected == nil {
-				return
-			}
-			runFiles(finalM.selected.Alias, "", false)
-		case "edit":
-			if finalM.selected == nil {
-				return
-			}
-			editHost(path, finalM.selected.Alias)
+			msg, err = forwardInteractive(alias)
 		case "add":
-			addHost(path)
+			msg, err = addHost(path)
+		case "edit":
+			msg, err = editHost(path, alias)
+		case "delete":
+			msg, err = deleteHost(path, alias)
+		case "keys":
+			msg, err = keysMenu(path)
+		case "upgrade":
+			var upgraded bool
+			if upgraded, msg, err = upgradeInteractive(); upgraded {
+				fmt.Println(msg)
+				return // the binary on disk is the new version now
+			}
+		}
+
+		status, statusErr = msg, false
+		switch {
+		case errors.Is(err, huh.ErrUserAborted):
+			status = "Cancelled"
+		case err != nil:
+			status, statusErr = err.Error(), true
 		}
 	}
 }
@@ -307,10 +303,62 @@ func required(name string) func(string) error {
 	}
 }
 
-// hostForm edits entry in place. originalKey is the IdentityFile before editing;
-// it is accepted as-is even if the file no longer exists.
-func hostForm(entry *SSHEntry, originalKey string) *huh.Form {
-	return huh.NewForm(
+// Key picker choices that are not a key path ('<' can't start a usable path).
+const (
+	keyChoiceKeep   = "<keep>"
+	keyChoiceNone   = "<none>"
+	keyChoiceBrowse = "<browse>"
+	keyChoiceType   = "<type>"
+)
+
+// keyOptions lists what the IdentityFile picker offers: the current key,
+// no key, the managed keys, keys found elsewhere, then browse / type a path.
+func keyOptions(current string) []huh.Option[string] {
+	var opts []huh.Option[string]
+	if current != "" {
+		opts = append(opts, huh.NewOption("Keep current: "+current, keyChoiceKeep))
+	}
+	opts = append(opts, huh.NewOption("No key (ssh agent, default keys or password)", keyChoiceNone))
+	for _, k := range listKeys() {
+		ref := keysDirRef + "/" + k
+		if ref != current {
+			opts = append(opts, huh.NewOption(k+"   (~/.ssh/keys)", ref))
+		}
+	}
+	for _, p := range discoverKeys() {
+		if p != expandHome(current) {
+			opts = append(opts, huh.NewOption(filepath.Base(p)+"   ("+tildePath(p)+", will offer to copy into ~/.ssh/keys)", p))
+		}
+	}
+	return append(opts,
+		huh.NewOption("Browse for a key file...", keyChoiceBrowse),
+		huh.NewOption("Type a path...", keyChoiceType))
+}
+
+// keyFilePicker is a file browser for choosing a private key, starting at home.
+func keyFilePicker(title string, value *string, validate func(string) error) *huh.FilePicker {
+	home, _ := os.UserHomeDir()
+	return huh.NewFilePicker().
+		Title(title).
+		Description("enter opens a folder or picks the file, backspace goes up, esc cancels").
+		CurrentDirectory(home).
+		ShowHidden(true).
+		ShowSize(true).
+		Height(15).
+		Value(value).
+		Validate(validate)
+}
+
+// runHostForm edits entry in place. originalKey is the IdentityFile before
+// editing; it is accepted as-is even if the file no longer exists.
+func runHostForm(entry *SSHEntry, originalKey string) error {
+	choice := keyChoiceNone
+	if originalKey != "" {
+		choice = keyChoiceKeep
+	}
+	browsed, typed := "", entry.IdentityFile
+
+	err := huh.NewForm(
 		huh.NewGroup(
 			huh.NewInput().
 				Title("Host Alias").
@@ -330,14 +378,46 @@ func hostForm(entry *SSHEntry, originalKey string) *huh.Form {
 				Title("Port").
 				Description("Optional (default 22)").
 				Value(&entry.Port),
-			huh.NewInput().
-				Title("IdentityFile").
-				Description("Optional key name in ~/.ssh/keys (tab completes) or a path to a key").
-				Suggestions(keySuggestions()).
-				Value(&entry.IdentityFile).
-				Validate(validateIdentityFile(originalKey)),
 		),
-	)
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Key (IdentityFile)").
+				Description("The private key / .pem used to log in. Keys in ~/.ssh/keys are listed first.").
+				Options(keyOptions(originalKey)...).
+				Value(&choice),
+		),
+		huh.NewGroup(
+			keyFilePicker("Pick the private key file", &browsed, validateIdentityFile(originalKey)),
+		).WithHideFunc(func() bool { return choice != keyChoiceBrowse }),
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Key path").
+				Description("A key name in ~/.ssh/keys (tab completes) or a path to a key").
+				Suggestions(keySuggestions()).
+				Value(&typed).
+				Validate(validateIdentityFile(originalKey)),
+		).WithHideFunc(func() bool { return choice != keyChoiceType }),
+	).Run()
+	if err != nil {
+		return err
+	}
+	entry.IdentityFile = chosenKey(choice, originalKey, browsed, typed)
+	return nil
+}
+
+// chosenKey turns the picker's answers into the IdentityFile value.
+func chosenKey(choice, original, browsed, typed string) string {
+	switch choice {
+	case keyChoiceKeep:
+		return original
+	case keyChoiceNone:
+		return ""
+	case keyChoiceBrowse:
+		return browsed
+	case keyChoiceType:
+		return cleanKeyInput(typed)
+	}
+	return choice
 }
 
 // applyKeyChoice resolves a changed IdentityFile, asking the user what to do with
@@ -368,126 +448,85 @@ func applyKeyChoice(entry *SSHEntry, originalKey string, entries []SSHEntry, sel
 	return nil
 }
 
-func addHost(path string) {
+func addHost(path string) (string, error) {
 	entries, err := parseConfig(path)
 	if err != nil {
-		fmt.Println("Error parsing config:", err)
-		return
+		return "", fmt.Errorf("parsing config: %w", err)
 	}
 
 	entry := newHostEntry()
-	if err := hostForm(&entry, "").Run(); err != nil {
-		return // User cancelled
+	if err := runHostForm(&entry, ""); err != nil {
+		return "", err
 	}
 	if findHost(entries, entry.Alias) != -1 {
-		fmt.Printf("Host '%s' already exists; use: gossh edit %s\n", entry.Alias, entry.Alias)
-		return
+		return "", fmt.Errorf("host %q already exists; select it and press e to edit it", entry.Alias)
 	}
 	if err := applyKeyChoice(&entry, "", entries, -1); err != nil {
-		fmt.Println("Error:", err)
-		return
+		return "", err
 	}
 
 	entries = append(entries, entry)
 	if err := writeConfig(path, entries); err != nil {
-		fmt.Println("Error saving:", err)
-	} else {
-		fmt.Println("Host added!")
+		return "", fmt.Errorf("saving: %w", err)
 	}
+	return "Added " + entry.Alias, nil
 }
 
-// selectHost asks the user to pick one of the editable hosts.
-func selectHost(entries []SSHEntry, title string) (string, bool) {
-	visible := hosts(entries)
-	if len(visible) == 0 {
-		fmt.Println("No hosts saved yet. Add one with: gossh add")
-		return "", false
-	}
-	options := make([]huh.Option[string], len(visible))
-	for i, e := range visible {
-		options[i] = huh.NewOption(fmt.Sprintf("%s (%s)", e.Alias, e.HostName), e.Alias)
-	}
-	var alias string
-	err := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().Title(title).Options(options...).Value(&alias),
-	)).Run()
-	return alias, err == nil
-}
-
-func deleteHost(path string) {
+func deleteHost(path, alias string) (string, error) {
 	entries, err := parseConfig(path)
 	if err != nil {
-		fmt.Println("Error parsing config:", err)
-		return
+		return "", fmt.Errorf("parsing config: %w", err)
 	}
-	alias, ok := selectHost(entries, "Select Host to Delete")
-	if !ok {
-		return
-	}
-
-	idx := findHost(entries, alias)
-	entries = append(entries[:idx], entries[idx+1:]...)
-	if err := writeConfig(path, entries); err != nil {
-		fmt.Println("Error saving:", err)
-		return
-	}
-	fmt.Printf("Deleted %s\n", alias)
-}
-
-func editHost(path string, alias string) {
-	entries, err := parseConfig(path)
-	if err != nil {
-		fmt.Println("Error parsing config:", err)
-		return
-	}
-
-	if alias == "" {
-		var ok bool
-		if alias, ok = selectHost(entries, "Select Host to Edit"); !ok {
-			return
-		}
-	}
-
 	idx := findHost(entries, alias)
 	if idx == -1 {
-		fmt.Printf("Host '%s' not found.\n", alias)
-		return
+		return "", fmt.Errorf("host %q not found", alias)
+	}
+
+	confirmed := false
+	if err := huh.NewConfirm().
+		Title(fmt.Sprintf("Delete %s?", alias)).
+		Description("Removes its Host block from ~/.ssh/config (the old file is kept as config.bak).\nKey files are not deleted.").
+		Affirmative("Delete").
+		Negative("Cancel").
+		Value(&confirmed).
+		Run(); err != nil || !confirmed {
+		return "", err
+	}
+
+	entries = append(entries[:idx], entries[idx+1:]...)
+	if err := writeConfig(path, entries); err != nil {
+		return "", fmt.Errorf("saving: %w", err)
+	}
+	return "Deleted " + alias, nil
+}
+
+func editHost(path string, alias string) (string, error) {
+	entries, err := parseConfig(path)
+	if err != nil {
+		return "", fmt.Errorf("parsing config: %w", err)
+	}
+	idx := findHost(entries, alias)
+	if idx == -1 {
+		return "", fmt.Errorf("host %q not found", alias)
 	}
 
 	entry := entries[idx]
 	originalKey := entry.IdentityFile
-	if err := hostForm(&entry, originalKey).Run(); err != nil {
-		return
+	if err := runHostForm(&entry, originalKey); err != nil {
+		return "", err
 	}
 	if entry.Alias != alias && findHost(entries, entry.Alias) != -1 {
-		fmt.Printf("Host '%s' already exists.\n", entry.Alias)
-		return
+		return "", fmt.Errorf("host %q already exists", entry.Alias)
 	}
 	if err := applyKeyChoice(&entry, originalKey, entries, idx); err != nil {
-		fmt.Println("Error:", err)
-		return
+		return "", err
 	}
 
 	entries[idx] = entry
 	if err := writeConfig(path, entries); err != nil {
-		fmt.Println("Error saving:", err)
-	} else {
-		fmt.Println("Host updated!")
+		return "", fmt.Errorf("saving: %w", err)
 	}
-}
-
-func listHostsCLI(path string) {
-	entries, err := parseConfig(path)
-	if err != nil {
-		fmt.Println("Error parsing config:", err)
-		return
-	}
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "ALIAS\tHOST\tUSER\tPORT\tKEY")
-	for _, e := range hosts(entries) {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Alias, e.HostName, e.User, e.Port, e.IdentityFile)
-	}
-	w.Flush()
+	return "Updated " + entry.Alias, nil
 }
 
 // --- Configuration Helpers (Standard Lib) ---
