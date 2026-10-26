@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"text/tabwriter"
 
@@ -77,6 +76,10 @@ func main() {
 		keysCommand(configPath, args[1:])
 	case "forward", "fwd":
 		forwardCommand(configPath, args[1:])
+	case "cp", "scp":
+		cpCommand(args[1:])
+	case "files", "browse", "sftp":
+		filesCommand(configPath, args[1:])
 	case "connect":
 		if len(args) < 2 {
 			fmt.Println("Usage: gossh connect <alias|user@host> [ssh args...]")
@@ -113,6 +116,16 @@ func printHelp() {
 	fmt.Println("      R:9000:3000             remote port 9000 -> your localhost:3000")
 	fmt.Println("      D:1080                  SOCKS proxy on localhost:1080 through the host")
 	fmt.Println()
+	fmt.Println("File transfer (SFTP, uses your ~/.ssh/config like ssh does):")
+	fmt.Println("  gossh files [alias] [dir]   Two-pane file browser (local | remote)")
+	fmt.Println("  gossh cp SRC... DST         Copy files, scp style; remote paths are alias:path")
+	fmt.Println("      prod:/var/log/app.log . download a file")
+	fmt.Println("      -r ./dist prod:/srv/app upload a folder (-r copies folders)")
+	fmt.Println("      \"prod:/var/log/*.log\" . wildcards work on both sides")
+	fmt.Println("      -p                      keep modification times and permissions")
+	fmt.Println("      -P port -i key -J jump  as in scp, for user@host targets")
+	fmt.Println("  --sudo                      (cp and files) act as root on the remote host")
+	fmt.Println()
 	fmt.Println("Keys (stored in ~/.ssh/keys):")
 	fmt.Println("  gossh keys                  List managed keys")
 	fmt.Println("  gossh keys import <path>    Copy a key into ~/.ssh/keys")
@@ -128,6 +141,7 @@ func printHelp() {
 	fmt.Println("Interactive TUI keys:")
 	fmt.Println("  enter                       Connect to selected host")
 	fmt.Println("  f                           Port forward through selected host")
+	fmt.Println("  t                           Browse / transfer files on selected host")
 	fmt.Println("  e                           Edit selected host")
 	fmt.Println("  a                           Add a new host")
 	fmt.Println("  /                           Filter hosts")
@@ -136,14 +150,7 @@ func printHelp() {
 
 // runSSH runs the system ssh client with the given arguments and exits with its status.
 func runSSH(args ...string) {
-	sshPath, err := exec.LookPath("ssh")
-	if err != nil {
-		fmt.Println("Error: ssh client not found on PATH.")
-		if runtime.GOOS == "windows" {
-			fmt.Println("Install it with (admin): Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0")
-		}
-		os.Exit(1)
-	}
+	sshPath := sshBinary()
 
 	// ssh handles Ctrl+C itself (e.g. to stop a forward); don't let it kill gossh first.
 	signal.Ignore(os.Interrupt)
@@ -168,7 +175,7 @@ var docStyle = lipgloss.NewStyle().Margin(1, 2)
 type model struct {
 	list     list.Model
 	selected *SSHEntry
-	action   string // "connect", "edit", "add" or "forward"
+	action   string // "connect", "edit", "add", "forward" or "files"
 	quitting bool
 }
 
@@ -192,10 +199,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if !m.list.SettingFilter() {
 			switch msg.String() {
-			case "e", "f":
+			case "e", "f", "t":
 				if i, ok := m.list.SelectedItem().(SSHEntry); ok {
 					m.selected = &i
-					m.action = map[string]string{"e": "edit", "f": "forward"}[msg.String()]
+					m.action = map[string]string{"e": "edit", "f": "forward", "t": "files"}[msg.String()]
 					return m, tea.Quit
 				}
 			case "a":
@@ -243,9 +250,10 @@ func runTUI(path string) {
 
 	connectKey := key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "connect"))
 	forwardKey := key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "forward"))
+	filesKey := key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "files"))
 	editKey := key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit"))
 	addKey := key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add"))
-	bindings := []key.Binding{connectKey, forwardKey, editKey, addKey}
+	bindings := []key.Binding{connectKey, forwardKey, filesKey, editKey, addKey}
 	l.AdditionalShortHelpKeys = func() []key.Binding { return bindings }
 	l.AdditionalFullHelpKeys = func() []key.Binding { return bindings }
 
@@ -272,6 +280,11 @@ func runTUI(path string) {
 				return
 			}
 			forwardInteractive(path, finalM.selected.Alias)
+		case "files":
+			if finalM.selected == nil {
+				return
+			}
+			runFiles(finalM.selected.Alias, "", false)
 		case "edit":
 			if finalM.selected == nil {
 				return

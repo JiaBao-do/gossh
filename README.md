@@ -1,6 +1,7 @@
 # gossh
 
-A terminal UI for managing and connecting to SSH hosts in `~/.ssh/config`.
+A terminal UI for managing and connecting to SSH hosts in `~/.ssh/config`,
+with port forwarding and FileZilla-style file transfer.
 
 ## Install
 
@@ -44,7 +45,7 @@ uses the binary next to it instead of downloading.
 
 ```
 gossh                    interactive host picker
-                         (enter = connect, f = forward, e = edit, a = add, / = filter)
+                         (enter = connect, f = forward, t = files, e = edit, a = add, / = filter)
 gossh prod-db            connect to a saved host
 gossh prod-db -A         any ssh flags pass straight through
 gossh user@1.2.3.4       plain ssh
@@ -67,6 +68,48 @@ gossh forward prod-db 8080:80 D:1080    several at once
 ```
 
 Ctrl+C stops it. Busy local ports are reported before connecting.
+
+### File transfer
+
+Transfers use SFTP over your system `ssh`, so everything in `~/.ssh/config`
+(aliases, keys, agents, `ProxyJump`, password prompts) works exactly as it
+does for `gossh <alias>`. The server only needs SFTP enabled, which is the
+OpenSSH default.
+
+**Browser:** `gossh files prod` (or `t` in the picker) opens two panes: this
+machine on the left and the host on the right.
+
+```
+tab        switch pane            space      mark / unmark (a = all)
+enter / →  open folder            c / F5     copy marked (or current) to the other pane
+⌫ / ←      parent folder          d / F8     delete       r / F2   rename
+g          go to a path           m / F7     new folder   .        show hidden
+~          home folder            esc        cancel the running transfer
+```
+
+Folders are copied recursively, existing files are only overwritten after
+you confirm, and a progress bar with speed shows at the bottom.
+
+**Command line:** `gossh cp` works like `scp`. Remote paths are `alias:path`
+(or `user@host:path`); relative remote paths start in your home folder.
+
+```
+gossh cp prod:/var/log/app.log .            download a file
+gossh cp report.pdf prod:                   upload into your home folder
+gossh cp -r ./dist prod:/srv/app            upload a folder (-r needed for folders)
+gossh cp -r prod:/srv/app/config ./backup/  trailing / creates the folder if missing
+gossh cp "prod:/var/log/*.log" logs/        wildcards (quote them for remote paths)
+gossh cp a.txt b.txt prod:/tmp              several files at once
+gossh cp -p ...                             keep modification times and permissions
+gossh cp -P 2222 -i key.pem f user@1.2.3.4:/tmp   scp-style -P / -i / -J / -o
+```
+
+**Root-owned paths:** add `--sudo` to `gossh cp` or `gossh files` to run the
+remote SFTP server through `sudo`, e.g.
+`gossh cp --sudo nginx.conf prod:/etc/nginx/`. Passwordless sudo is used
+when available; otherwise gossh asks for the sudo password. Files written
+this way are owned by root. Hosts whose sudoers has `requiretty` are not
+supported.
 
 ### Keys
 
@@ -101,7 +144,7 @@ and the previous file is saved to `~/.ssh/config.bak` before every change.
 
 ## Development
 
-Requires Go 1.26+, GNU make and `sh` (Git Bash on Windows).
+Requires Go 1.27.3+, GNU make and `sh` (Git Bash on Windows).
 
 ```
 make                 build bin/gossh for this machine

@@ -175,17 +175,8 @@ func startForwards(host string, specs []string) {
 // forwardInteractive guides the user through a single forward.
 func forwardInteractive(configPath, host string) {
 	if host == "" {
-		entries, err := parseConfig(configPath)
-		if err != nil {
-			fmt.Println("Error parsing config:", err)
-			return
-		}
-		if len(hosts(entries)) > 0 {
-			var ok bool
-			if host, ok = selectHost(entries, "Forward through which host?"); !ok {
-				return
-			}
-		} else if err := huh.NewInput().Title("Host (alias or user@host)").Value(&host).Validate(required("host")).Run(); err != nil {
+		var ok bool
+		if host, ok = chooseHost(configPath, "Forward through which host?"); !ok {
 			return
 		}
 	}
@@ -261,6 +252,23 @@ func forwardInteractive(configPath, host string) {
 	}
 
 	startForwards(host, []string{spec})
+}
+
+// chooseHost picks a saved host, or asks for alias/user@host when none are saved.
+func chooseHost(configPath, title string) (string, bool) {
+	entries, err := parseConfig(configPath)
+	if err != nil {
+		fmt.Println("Error parsing config:", err)
+		return "", false
+	}
+	if len(hosts(entries)) > 0 {
+		return selectHost(entries, title)
+	}
+	var host string
+	if err := huh.NewInput().Title("Host (alias or user@host)").Value(&host).Validate(required("host")).Run(); err != nil {
+		return "", false
+	}
+	return host, true
 }
 
 // splitTarget accepts "host:port" or a bare port (meaning localhost).
